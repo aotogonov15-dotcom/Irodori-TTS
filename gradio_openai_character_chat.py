@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 
 import gradio as gr
 
@@ -25,6 +26,7 @@ OUTPUT_DIR = BASE_DIR / "outputs" / "gradio_character_chat"
 ChatMessage = dict[str, str]
 HistoryItem = dict[str, str]
 SessionSettings = dict[str, str]
+TranscriptionTracker = dict[str, object]
 
 SUPPORTED_REFERENCE_AUDIO_EXTENSIONS = {
     ".wav",
@@ -34,6 +36,11 @@ SUPPORTED_REFERENCE_AUDIO_EXTENSIONS = {
     ".m4a",
 }
 
+TRANSCRIPTION_PROCESSING_STATUS = "文字起こし中..."
+TRANSCRIPTION_SUCCESS_STATUS = (
+    "文字起こししました。内容を確認・修正してから送信してください。"
+)
+
 
 @dataclass
 class AppResources:
@@ -41,6 +48,14 @@ class AppResources:
     voice_engine: VoiceEngine
     transcription_engine: OpenAITranscriptionEngine
     initial_settings: SessionSettings
+    transcription_lock: object = field(default_factory=Lock, repr=False)
+    transcription_tracker: TranscriptionTracker = field(
+        default_factory=lambda: {
+            "active_audio_ids": set(),
+            "completed_audio_id": None,
+            "completed_text": None,
+        },
+    )
 
 
 def _create_session_settings(
@@ -369,25 +384,121 @@ def _clear_conversation() -> tuple[
     )
 
 
+def _transcription_audio_id(microphone_audio: str | Path | None) -> str | None:
+    audio_path_text = str(microphone_audio or "").strip()
+
+    if not audio_path_text:
+        return None
+
+    path = Path(audio_path_text)
+
+    try:
+        stat_result = path.stat()
+
+    except OSError:
+        return f"{path}|missing"
+
+    try:
+        resolved_path = path.resolve()
+
+    except OSError:
+        resolved_path = path.absolute()
+
+    return f"{resolved_path}|{stat_result.st_size}|{stat_result.st_mtime_ns}"
+
+
+def _active_transcription_audio_ids(
+    tracker: TranscriptionTracker,
+) -> set[str]:
+    active_audio_ids = tracker.get("active_audio_ids")
+
+    if isinstance(active_audio_ids, set):
+        return active_audio_ids
+
+    active_audio_ids = set()
+    tracker["active_audio_ids"] = active_audio_ids
+    return active_audio_ids
+
+
+def _start_transcription(
+    microphone_audio: str | Path | None,
+    resources: AppResources,
+) -> tuple[str | None, str | None, bool]:
+    audio_id = _transcription_audio_id(microphone_audio)
+
+    if audio_id is None:
+        return None, None, False
+
+    with resources.transcription_lock:
+        tracker = resources.transcription_tracker
+        active_audio_ids = _active_transcription_audio_ids(tracker)
+
+        if audio_id in active_audio_ids:
+            return audio_id, None, True
+
+        completed_text = tracker.get("completed_text")
+        if tracker.get("completed_audio_id") == audio_id and isinstance(
+            completed_text,
+            str,
+        ):
+            return audio_id, completed_text, False
+
+        active_audio_ids.add(audio_id)
+
+    return audio_id, None, False
+
+
+def _finish_transcription(
+    audio_id: str | None,
+    transcribed_text: str | None,
+    resources: AppResources,
+) -> None:
+    if audio_id is None:
+        return
+
+    with resources.transcription_lock:
+        tracker = resources.transcription_tracker
+        active_audio_ids = _active_transcription_audio_ids(tracker)
+
+        active_audio_ids.discard(audio_id)
+
+        if transcribed_text is not None:
+            tracker["completed_audio_id"] = audio_id
+            tracker["completed_text"] = transcribed_text
+
+
 def _transcribe_microphone_audio(
     microphone_audio: str | Path | None,
     current_user_text: str,
     resources: AppResources,
 ) -> tuple[str, str]:
     previous_text = str(current_user_text or "")
+    audio_id, cached_text, already_active = _start_transcription(
+        microphone_audio,
+        resources,
+    )
+
+    if cached_text is not None:
+        return cached_text, TRANSCRIPTION_SUCCESS_STATUS
+
+    if already_active:
+        return previous_text, TRANSCRIPTION_PROCESSING_STATUS
 
     try:
         transcribed_text = resources.transcription_engine.transcribe(microphone_audio)
 
     except Exception as error:
+        _finish_transcription(audio_id, None, resources)
         return (
             previous_text,
             f"文字起こしに失敗しました: {error}",
         )
 
+    _finish_transcription(audio_id, transcribed_text, resources)
+
     return (
         transcribed_text,
-        "文字起こししました。内容を確認・修正してから送信してください。",
+        TRANSCRIPTION_SUCCESS_STATUS,
     )
 
 
@@ -395,17 +506,19 @@ def _transcribe_microphone_audio_with_status(
     microphone_audio: str | Path | None,
     current_user_text: str,
     resources: AppResources,
-) -> Iterator[tuple[str, str]]:
+) -> Iterator[tuple[str, str, object]]:
     yield (
         str(current_user_text or ""),
-        "文字起こし中...",
+        TRANSCRIPTION_PROCESSING_STATUS,
+        gr.update(interactive=False),
     )
 
-    yield _transcribe_microphone_audio(
+    transcribed_text, status = _transcribe_microphone_audio(
         microphone_audio,
         current_user_text,
         resources,
     )
+    yield transcribed_text, status, gr.update(interactive=True)
 
 
 def _apply_session_settings(
@@ -499,7 +612,7 @@ def build_ui(resources: AppResources) -> gr.Blocks:
         def transcribe_microphone_audio(
             microphone_audio: str | Path | None,
             current_user_text: str,
-        ) -> Iterator[tuple[str, str]]:
+        ) -> Iterator[tuple[str, str, object]]:
             yield from _transcribe_microphone_audio_with_status(
                 microphone_audio,
                 current_user_text,
@@ -635,6 +748,7 @@ def build_ui(resources: AppResources) -> gr.Blocks:
             outputs=[
                 user_input,
                 status,
+                transcribe_button,
             ],
         )
         microphone_audio.stop_recording(
@@ -646,6 +760,7 @@ def build_ui(resources: AppResources) -> gr.Blocks:
             outputs=[
                 user_input,
                 status,
+                transcribe_button,
             ],
         )
         clear_button.click(
