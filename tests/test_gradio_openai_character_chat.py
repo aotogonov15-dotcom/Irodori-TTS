@@ -3,18 +3,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
 
 import gradio as gr
 
-from conversation_engine import CharacterProfile, ConversationTurn
+from conversation_engine import ConversationTurn
 from gradio_openai_character_chat import (
     AppResources,
     TRANSCRIPTION_PROCESSING_STATUS,
     TRANSCRIPTION_SUCCESS_STATUS,
     _apply_session_settings,
     _clear_conversation,
-    _create_conversation_engine,
+    _submit_message,
     _transcribe_microphone_audio,
     _transcribe_microphone_audio_with_status,
     _transcription_audio_id,
@@ -175,37 +175,149 @@ class GradioCharacterSettingsTest(unittest.TestCase):
             self.assertFalse(microphone_audio.autoplay)
             self.assertTrue(generated_audio.autoplay)
 
-    def test_create_conversation_engine_passes_initial_history(self) -> None:
+    def test_submit_message_generates_reply_through_chat_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             audio_path = self._write_audio(Path(temp_dir) / "reference.wav")
             resources = self._resources(audio_path)
-            profile = CharacterProfile(
-                name="テストキャラクター",
-                first_person="私",
-                personality="明るい",
-                speaking_style="自然に話す",
-            )
             history = [
-                ConversationTurn(
-                    user_text="こんにちは",
-                    character_text="こんにちは。",
-                )
+                {
+                    "user_text": "こんにちは",
+                    "character_text": "こんにちは。",
+                }
             ]
 
-            with patch(
-                "gradio_openai_character_chat.OpenAIConversationEngine",
-                FakeConversationEngine,
-            ):
-                engine = _create_conversation_engine(
-                    resources,
-                    profile,
-                    history,
-                )
+            generator = _submit_message(
+                "次の入力",
+                history,
+                resources.initial_settings,
+                resources,
+            )
+            next(generator)
+            next(generator)
 
-            self.assertIs(engine.profile, profile)
-            self.assertIs(engine.config, resources.llm_config)
-            self.assertEqual(engine.initial_history, tuple(history))
-            self.assertFalse(hasattr(engine, "_history"))
+            self.assertEqual(len(resources.chat_service.reply_calls), 1)
+            reply_call = resources.chat_service.reply_calls[0]
+            self.assertEqual(reply_call["user_text"], "次の入力")
+            self.assertEqual(reply_call["profile"].name, resources.initial_settings["name"])
+            self.assertEqual(
+                reply_call["initial_history"],
+                (
+                    ConversationTurn(
+                        user_text="こんにちは",
+                        character_text="こんにちは。",
+                    ),
+                ),
+            )
+
+    def test_submit_message_generates_voice_through_chat_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = self._write_audio(Path(temp_dir) / "reference.wav")
+            resources = self._resources(audio_path)
+
+            generator = _submit_message(
+                "次の入力",
+                [],
+                resources.initial_settings,
+                resources,
+            )
+
+            list(generator)
+
+            self.assertEqual(
+                resources.chat_service.voice_calls,
+                [
+                    {
+                        "text": "サービスからの返答",
+                        "reference_audio": str(audio_path.resolve()),
+                    }
+                ],
+            )
+
+    def test_submit_message_keeps_existing_llm_failure_display(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = self._write_audio(Path(temp_dir) / "reference.wav")
+            resources = self._resources(audio_path)
+            resources.chat_service.reply_error = RuntimeError("LLM failure")
+
+            outputs = list(
+                _submit_message(
+                    "次の入力",
+                    [],
+                    resources.initial_settings,
+                    resources,
+                )
+            )
+
+            user_input, chat_messages, history_state, audio_update, status = outputs[-1]
+            self.assertEqual(user_input, "次の入力")
+            self.assertEqual(chat_messages, [])
+            self.assertEqual(history_state, [])
+            self.assertIsNone(audio_update["value"])
+            self.assertIn("OpenAI", status)
+            self.assertIn("LLM failure", status)
+
+    def test_submit_message_keeps_reply_and_history_when_voice_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = self._write_audio(Path(temp_dir) / "reference.wav")
+            resources = self._resources(audio_path)
+            resources.chat_service.voice_error = RuntimeError("voice failure")
+
+            outputs = list(
+                _submit_message(
+                    "次の入力",
+                    [],
+                    resources.initial_settings,
+                    resources,
+                )
+            )
+
+            user_input, chat_messages, history_state, audio_update, status = outputs[-1]
+            self.assertEqual(user_input, "")
+            self.assertEqual(
+                chat_messages,
+                [
+                    {
+                        "role": "user",
+                        "content": "次の入力",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "サービスからの返答",
+                    },
+                ],
+            )
+            self.assertEqual(
+                history_state,
+                [
+                    {
+                        "user_text": "次の入力",
+                        "character_text": "サービスからの返答",
+                    }
+                ],
+            )
+            self.assertIsNone(audio_update["value"])
+            self.assertIn("voice failure", status)
+
+    def test_submit_message_success_keeps_chat_history_audio_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = self._write_audio(Path(temp_dir) / "reference.wav")
+            resources = self._resources(audio_path)
+
+            outputs = list(
+                _submit_message(
+                    "次の入力",
+                    [],
+                    resources.initial_settings,
+                    resources,
+                )
+            )
+
+            user_input, chat_messages, history_state, audio_update, status = outputs[-1]
+            self.assertEqual(user_input, "")
+            self.assertEqual(chat_messages[-1]["content"], "サービスからの返答")
+            self.assertEqual(history_state[-1]["character_text"], "サービスからの返答")
+            self.assertEqual(audio_update["value"], str(resources.chat_service.output_path))
+            self.assertIn("Seed", status)
 
     def test_transcription_result_is_written_to_user_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -475,6 +587,7 @@ class GradioCharacterSettingsTest(unittest.TestCase):
         return AppResources(
             llm_config=object(),
             voice_engine=object(),
+            chat_service=FakeChatService(audio_path),
             transcription_engine=FakeTranscriptionEngine(),
             initial_settings={
                 "name": "初期",
@@ -504,17 +617,63 @@ class FakeTranscriptionEngine:
         return "文字起こし結果"
 
 
-class FakeConversationEngine:
-    def __init__(
+class FakeChatService:
+    def __init__(self, audio_path: Path) -> None:
+        self.output_path = audio_path.parent / "generated.wav"
+        self.reply_error: Exception | None = None
+        self.voice_error: Exception | None = None
+        self.reply_calls = []
+        self.voice_calls = []
+
+    def generate_reply(
         self,
-        *,
-        profile: CharacterProfile,
-        config: object,
-        initial_history,
-    ) -> None:
-        self.profile = profile
-        self.config = config
-        self.initial_history = tuple(initial_history)
+        user_text: str,
+        profile,
+        initial_history=None,
+    ):
+        initial_history = tuple(initial_history or ())
+        self.reply_calls.append(
+            {
+                "user_text": user_text,
+                "profile": profile,
+                "initial_history": initial_history,
+            }
+        )
+
+        if self.reply_error:
+            raise self.reply_error
+
+        return SimpleNamespace(
+            reply=SimpleNamespace(text="サービスからの返答"),
+            history=(
+                *initial_history,
+                ConversationTurn(
+                    user_text=str(user_text).strip(),
+                    character_text="サービスからの返答",
+                ),
+            ),
+        )
+
+    def generate_voice(
+        self,
+        text: str,
+        reference_audio=None,
+    ):
+        self.voice_calls.append(
+            {
+                "text": text,
+                "reference_audio": reference_audio,
+            }
+        )
+
+        if self.voice_error:
+            raise self.voice_error
+
+        return SimpleNamespace(
+            output_path=self.output_path,
+            used_seed=1234,
+            generation_seconds=0.125,
+        )
 
 
 if __name__ == "__main__":
