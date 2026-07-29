@@ -9,10 +9,10 @@ from threading import Lock
 
 import gradio as gr
 
+from character_chat_service import CharacterChatService
 from character_profile_loader import load_character_config
 from conversation_engine import CharacterProfile, ConversationTurn
 from llm_config import LLMConfig
-from openai_conversation_engine import OpenAIConversationEngine
 from openai_transcription_engine import OpenAITranscriptionEngine
 from voice_engine import VoiceEngine
 
@@ -46,6 +46,7 @@ TRANSCRIPTION_SUCCESS_STATUS = (
 class AppResources:
     llm_config: LLMConfig
     voice_engine: VoiceEngine
+    chat_service: CharacterChatService
     transcription_engine: OpenAITranscriptionEngine
     initial_settings: SessionSettings
     transcription_lock: object = field(default_factory=Lock, repr=False)
@@ -84,6 +85,7 @@ def _load_resources() -> AppResources:
     return AppResources(
         llm_config=llm_config,
         voice_engine=voice_engine,
+        chat_service=CharacterChatService(llm_config, voice_engine),
         transcription_engine=OpenAITranscriptionEngine(llm_config),
         initial_settings=_create_session_settings(
             character_config.profile,
@@ -258,19 +260,6 @@ def _build_chat_messages(history: list[ConversationTurn]) -> list[ChatMessage]:
     return messages
 
 
-def _create_conversation_engine(
-    resources: AppResources,
-    profile: CharacterProfile,
-    history: list[ConversationTurn],
-) -> OpenAIConversationEngine:
-    engine = OpenAIConversationEngine(
-        profile=profile,
-        config=resources.llm_config,
-        initial_history=history,
-    )
-    return engine
-
-
 def _submit_message(
     user_text: str,
     history: list[HistoryItem] | None,
@@ -308,12 +297,11 @@ def _submit_message(
 
     try:
         profile = _session_settings_to_profile(current_settings)
-        conversation_engine = _create_conversation_engine(
-            resources,
+        reply_result = resources.chat_service.generate_reply(
+            cleaned_text,
             profile,
-            current_history,
+            initial_history=current_history,
         )
-        reply = conversation_engine.generate_reply(cleaned_text)
 
     except Exception as error:
         yield (
@@ -325,7 +313,7 @@ def _submit_message(
         )
         return
 
-    updated_history = list(conversation_engine.history)
+    updated_history = list(reply_result.history)
     updated_history_state = _turns_to_history_state(updated_history)
     chat_messages = _build_chat_messages(updated_history)
 
@@ -338,8 +326,8 @@ def _submit_message(
     )
 
     try:
-        voice_result = resources.voice_engine.generate(
-            reply.text,
+        voice_result = resources.chat_service.generate_voice(
+            reply_result.reply.text,
             reference_audio=current_settings["reference_audio_path"],
         )
 
