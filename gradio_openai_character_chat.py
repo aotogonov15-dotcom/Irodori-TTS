@@ -266,8 +266,8 @@ def _create_conversation_engine(
     engine = OpenAIConversationEngine(
         profile=profile,
         config=resources.llm_config,
+        initial_history=history,
     )
-    engine._history = list(history)
     return engine
 
 

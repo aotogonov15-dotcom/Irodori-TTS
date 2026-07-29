@@ -3,15 +3,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import gradio as gr
 
+from conversation_engine import CharacterProfile, ConversationTurn
 from gradio_openai_character_chat import (
     AppResources,
     TRANSCRIPTION_PROCESSING_STATUS,
     TRANSCRIPTION_SUCCESS_STATUS,
     _apply_session_settings,
     _clear_conversation,
+    _create_conversation_engine,
     _transcribe_microphone_audio,
     _transcribe_microphone_audio_with_status,
     _transcription_audio_id,
@@ -171,6 +174,38 @@ class GradioCharacterSettingsTest(unittest.TestCase):
             self.assertFalse(reference_audio.autoplay)
             self.assertFalse(microphone_audio.autoplay)
             self.assertTrue(generated_audio.autoplay)
+
+    def test_create_conversation_engine_passes_initial_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = self._write_audio(Path(temp_dir) / "reference.wav")
+            resources = self._resources(audio_path)
+            profile = CharacterProfile(
+                name="テストキャラクター",
+                first_person="私",
+                personality="明るい",
+                speaking_style="自然に話す",
+            )
+            history = [
+                ConversationTurn(
+                    user_text="こんにちは",
+                    character_text="こんにちは。",
+                )
+            ]
+
+            with patch(
+                "gradio_openai_character_chat.OpenAIConversationEngine",
+                FakeConversationEngine,
+            ):
+                engine = _create_conversation_engine(
+                    resources,
+                    profile,
+                    history,
+                )
+
+            self.assertIs(engine.profile, profile)
+            self.assertIs(engine.config, resources.llm_config)
+            self.assertEqual(engine.initial_history, tuple(history))
+            self.assertFalse(hasattr(engine, "_history"))
 
     def test_transcription_result_is_written_to_user_input(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -467,6 +502,19 @@ class FakeTranscriptionEngine:
             raise self.error
 
         return "文字起こし結果"
+
+
+class FakeConversationEngine:
+    def __init__(
+        self,
+        *,
+        profile: CharacterProfile,
+        config: object,
+        initial_history,
+    ) -> None:
+        self.profile = profile
+        self.config = config
+        self.initial_history = tuple(initial_history)
 
 
 if __name__ == "__main__":

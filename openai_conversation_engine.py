@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from openai import (
@@ -31,12 +32,14 @@ class OpenAIConversationEngine:
         self,
         profile: CharacterProfile,
         config: LLMConfig,
+        initial_history: Iterable[ConversationTurn] | None = None,
     ) -> None:
         config.validate()
 
         self.profile = profile
         self.config = config
-        self._history: list[ConversationTurn] = []
+        self._history: list[ConversationTurn] = list(initial_history or [])
+        self._trim_history()
 
         self._client = OpenAI(
             api_key=config.api_key,
