@@ -29,6 +29,23 @@ CODEC_PRECISION = "bf16"
 
 
 @dataclass(frozen=True)
+class VoiceGenerationSettings:
+    num_steps: int = 16
+    t_schedule_mode: str = "sway"
+    sway_coeff: float = -1.0
+    cfg_guidance_mode: str = "independent"
+    cfg_scale_text: float = 3.0
+    cfg_scale_speaker: float = 7.0
+    duration_scale: float = 1.0
+    seed: int = 1234
+    num_candidates: int = 1
+    decode_mode: str = "sequential"
+    ref_normalize_db: float = -16.0
+    ref_ensure_max: bool = True
+    max_ref_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class VoiceGenerationResult:
     """音声生成結果をまとめて返すためのデータ。"""
 
@@ -94,10 +111,12 @@ class VoiceEngine:
         self,
         text: str,
         reference_audio: str | Path | None = None,
+        settings: VoiceGenerationSettings | None = None,
     ) -> VoiceGenerationResult:
         """入力された文章から音声を生成して保存する。"""
 
         cleaned_text = text.strip()
+        active_settings = settings or VoiceGenerationSettings()
 
         if not cleaned_text:
             raise ValueError("文章が入力されていません。")
@@ -125,23 +144,23 @@ class VoiceEngine:
                 text=cleaned_text,
                 ref_wav=str(active_reference_audio),
 
-                num_steps=16,
-                t_schedule_mode="sway",
-                sway_coeff=-1.0,
+                num_steps=active_settings.num_steps,
+                t_schedule_mode=active_settings.t_schedule_mode,
+                sway_coeff=active_settings.sway_coeff,
 
-                cfg_guidance_mode="independent",
-                cfg_scale_text=3.0,
-                cfg_scale_speaker=7.0,
+                cfg_guidance_mode=active_settings.cfg_guidance_mode,
+                cfg_scale_text=active_settings.cfg_scale_text,
+                cfg_scale_speaker=active_settings.cfg_scale_speaker,
 
-                duration_scale=1.0,
-                seed=1234,
+                duration_scale=active_settings.duration_scale,
+                seed=active_settings.seed,
 
-                num_candidates=1,
-                decode_mode="sequential",
+                num_candidates=active_settings.num_candidates,
+                decode_mode=active_settings.decode_mode,
 
-                ref_normalize_db=-16.0,
-                ref_ensure_max=True,
-                max_ref_seconds=30.0,
+                ref_normalize_db=active_settings.ref_normalize_db,
+                ref_ensure_max=active_settings.ref_ensure_max,
+                max_ref_seconds=active_settings.max_ref_seconds,
             ),
             log_fn=None,
         )

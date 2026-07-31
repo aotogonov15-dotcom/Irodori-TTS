@@ -8,7 +8,7 @@ from character_chat_service import CharacterChatService
 from conversation_engine import CharacterProfile, ConversationTurn
 from llm_config import LLMConfig
 from openai_conversation_engine import LLMReply
-from voice_engine import VoiceGenerationResult
+from voice_engine import VoiceGenerationResult, VoiceGenerationSettings
 
 
 class CharacterChatServiceTest(unittest.TestCase):
@@ -82,10 +82,48 @@ class CharacterChatServiceTest(unittest.TestCase):
                 {
                     "text": "返答本文",
                     "reference_audio": "reference.wav",
+                    "settings": None,
                 }
             ],
         )
         self.assertEqual(result, voice_engine.result)
+
+    def test_generate_voice_passes_settings_to_voice_engine(self) -> None:
+        voice_engine = FakeVoiceEngine()
+        service = CharacterChatService(
+            llm_config=self._config(),
+            voice_engine=voice_engine,
+        )
+        settings = VoiceGenerationSettings(seed=4321, num_steps=8)
+
+        result = service.generate_voice(
+            "reply text",
+            reference_audio="reference.wav",
+            settings=settings,
+        )
+
+        self.assertEqual(
+            voice_engine.calls,
+            [
+                {
+                    "text": "reply text",
+                    "reference_audio": "reference.wav",
+                    "settings": settings,
+                }
+            ],
+        )
+        self.assertEqual(result, voice_engine.result)
+
+    def test_generate_voice_without_settings_keeps_existing_behavior(self) -> None:
+        voice_engine = FakeVoiceEngine()
+        service = CharacterChatService(
+            llm_config=self._config(),
+            voice_engine=voice_engine,
+        )
+
+        service.generate_voice("reply text", reference_audio="reference.wav")
+
+        self.assertIsNone(voice_engine.calls[0]["settings"])
 
     def test_service_does_not_depend_on_gradio(self) -> None:
         service_source = Path("character_chat_service.py").read_text(encoding="utf-8")
@@ -159,11 +197,13 @@ class FakeVoiceEngine:
         self,
         text: str,
         reference_audio=None,
+        settings=None,
     ) -> VoiceGenerationResult:
         self.calls.append(
             {
                 "text": text,
                 "reference_audio": reference_audio,
+                "settings": settings,
             }
         )
         return self.result
