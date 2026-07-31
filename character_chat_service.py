@@ -7,7 +7,7 @@ from pathlib import Path
 from conversation_engine import CharacterProfile, ConversationTurn
 from llm_config import LLMConfig
 from openai_conversation_engine import LLMReply, OpenAIConversationEngine
-from voice_engine import VoiceEngine, VoiceGenerationResult
+from voice_engine import VoiceEngine, VoiceGenerationResult, VoiceGenerationSettings
 
 
 @dataclass(frozen=True)
@@ -47,8 +47,10 @@ class CharacterChatService:
         self,
         text: str,
         reference_audio: str | Path | None = None,
+        settings: VoiceGenerationSettings | None = None,
     ) -> VoiceGenerationResult:
         return self.voice_engine.generate(
             text,
             reference_audio=reference_audio,
+            settings=settings,
         )
