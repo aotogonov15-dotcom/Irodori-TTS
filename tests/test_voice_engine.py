@@ -50,7 +50,7 @@ class VoiceEngineGenerateTest(unittest.TestCase):
             engine._runtime = fake_runtime
 
             with patch("voice_engine.save_wav", return_value=base_dir / "generated.wav"):
-                engine.generate("縺薙ｓ縺ｫ縺｡縺ｯ")
+                engine.generate("こんにちは")
 
             self._assert_sampling_settings(
                 fake_runtime.requests[0],
@@ -68,20 +68,20 @@ class VoiceEngineGenerateTest(unittest.TestCase):
                 num_steps=8,
                 t_schedule_mode="linear",
                 sway_coeff=0.25,
-                cfg_guidance_mode="combined",
+                cfg_guidance_mode="alternating",
                 cfg_scale_text=2.0,
                 cfg_scale_speaker=4.5,
                 duration_scale=1.25,
                 seed=4321,
                 num_candidates=2,
-                decode_mode="parallel",
+                decode_mode="batch",
                 ref_normalize_db=-12.0,
                 ref_ensure_max=False,
                 max_ref_seconds=12.5,
             )
 
             with patch("voice_engine.save_wav", return_value=base_dir / "generated.wav"):
-                engine.generate("縺薙ｓ縺ｫ縺｡縺ｯ", settings=settings)
+                engine.generate("こんにちは", settings=settings)
 
             self._assert_sampling_settings(fake_runtime.requests[0], settings)
 
@@ -95,7 +95,7 @@ class VoiceEngineGenerateTest(unittest.TestCase):
             original_settings = VoiceGenerationSettings(seed=4321, num_steps=8)
 
             with patch("voice_engine.save_wav", return_value=base_dir / "generated.wav"):
-                engine.generate("縺薙ｓ縺ｫ縺｡縺ｯ", settings=settings)
+                engine.generate("こんにちは", settings=settings)
 
             self.assertEqual(settings, original_settings)
 
@@ -125,7 +125,7 @@ class VoiceEngineGenerateTest(unittest.TestCase):
 
             with patch("voice_engine.save_wav", return_value=base_dir / "generated.wav"):
                 engine.generate(
-                    "縺薙ｓ縺ｫ縺｡縺ｯ",
+                    "こんにちは",
                     reference_audio=override_audio,
                     settings=VoiceGenerationSettings(seed=4321),
                 )
@@ -169,7 +169,7 @@ class VoiceEngineGenerateTest(unittest.TestCase):
             engine._runtime = FakeRuntime()
 
             with patch("voice_engine.save_wav", return_value=saved_path):
-                result = engine.generate("縺薙ｓ縺ｫ縺｡縺ｯ")
+                result = engine.generate("こんにちは")
 
             self.assertEqual(result.output_path, saved_path.resolve())
             self.assertEqual(result.used_seed, 1234)
