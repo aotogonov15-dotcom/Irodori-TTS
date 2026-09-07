@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from irodori_tts.local_worker import run_worker
+from irodori_tts.local_worker import _configure_standard_streams, run_worker
 from voice_engine import VoiceGenerationResult, VoiceGenerationSettings
 
 
@@ -334,6 +334,63 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertIn("load stdout log", stderr)
         self.assertIn("generate stdout log", stderr)
 
+    def test_entry_point_streams_use_utf8_for_japanese_json_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+            output_path = base_dir / "reply.wav"
+            request = self._generate_request(
+                "request-1",
+                text="こんにちは。今日はいい天気だね。",
+                reference_audio=reference,
+                output_path=output_path,
+            )
+            raw_input = (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+
+            responses, _stderr = self._run_protocol_bytes(raw_input)
+
+        self.assertEqual(responses[0]["id"], "request-1")
+        self.assertTrue(responses[0]["ok"])
+        self.assertEqual(
+            FakeVoiceEngine.instances[0].generate_calls[0]["text"],
+            "こんにちは。今日はいい天気だね。",
+        )
+
+    def test_entry_point_streams_keep_ascii_escaped_json_working(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+            output_path = base_dir / "reply.wav"
+            requests = [
+                self._generate_request(
+                    "request-1",
+                    text="こんばんは",
+                    reference_audio=reference,
+                    output_path=output_path,
+                ),
+                {"id": "shutdown-1", "type": "shutdown"},
+            ]
+            raw_input = "".join(json.dumps(request, ensure_ascii=True) + "\n" for request in requests)
+            responses, _stderr = self._run_protocol_bytes(raw_input.encode("ascii"))
+
+        self.assertEqual([response["id"] for response in responses], ["request-1", "shutdown-1"])
+        self.assertTrue(responses[0]["ok"])
+        self.assertTrue(responses[1]["ok"])
+        self.assertEqual(FakeVoiceEngine.instances[0].generate_calls[0]["text"], "こんばんは")
+
+    def test_entry_point_stdout_is_utf8_json_lines_only(self) -> None:
+        raw_input = (json.dumps({"id": "request-1", "type": "ping"}) + "\n").encode("utf-8")
+
+        raw_output, stderr = self._run_protocol_bytes(raw_input, raw_output=True)
+
+        output_text = raw_output.decode("utf-8")
+        output_lines = output_text.splitlines()
+        self.assertEqual(len(output_lines), 1)
+        self.assertEqual(json.loads(output_lines[0])["error"]["code"], "unknown_request")
+        self.assertIn("未対応のrequest typeです。", output_text)
+        self.assertNotIn("stdout log", output_text)
+        self.assertEqual(stderr.decode("utf-8"), "")
+
     def _single_response(self, request: dict) -> dict:
         responses, _stderr = self._run([request])
         self.assertEqual(len(responses), 1)
@@ -360,6 +417,31 @@ class LocalWorkerTest(unittest.TestCase):
             return output, error_stream.getvalue()
         responses = [json.loads(line) for line in output.splitlines()]
         return responses, error_stream.getvalue()
+
+    def _run_protocol_bytes(self, raw_input: bytes, *, raw_output: bool = False):
+        input_bytes = io.BytesIO(raw_input)
+        output_bytes = io.BytesIO()
+        error_bytes = io.BytesIO()
+        input_stream = io.TextIOWrapper(input_bytes, encoding="cp932", errors="surrogateescape")
+        output_stream = io.TextIOWrapper(output_bytes, encoding="cp932", errors="surrogateescape")
+        error_stream = io.TextIOWrapper(error_bytes, encoding="cp932", errors="backslashreplace")
+
+        _configure_standard_streams(input_stream, output_stream, error_stream)
+        run_worker(
+            input_stream,
+            output_stream,
+            error_stream,
+            engine_factory=FakeVoiceEngine,
+        )
+        output_stream.flush()
+        error_stream.flush()
+
+        raw_output_bytes = output_bytes.getvalue()
+        raw_error_bytes = error_bytes.getvalue()
+        if raw_output:
+            return raw_output_bytes, raw_error_bytes
+        responses = [json.loads(line) for line in raw_output_bytes.decode("utf-8").splitlines()]
+        return responses, raw_error_bytes.decode("utf-8")
 
     def _generate_request(
         self,

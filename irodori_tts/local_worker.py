@@ -191,7 +191,18 @@ def run_worker(
 
 
 def main() -> None:
+    _configure_standard_streams(sys.stdin, sys.stdout, sys.stderr)
     run_worker(sys.stdin, sys.stdout, sys.stderr)
+
+
+def _configure_standard_streams(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    error_stream: TextIO,
+) -> None:
+    input_stream.reconfigure(encoding="utf-8", errors="strict")
+    output_stream.reconfigure(encoding="utf-8", errors="strict")
+    error_stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 def _parse_json_line(line: str) -> dict[str, Any]:
