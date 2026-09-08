@@ -82,10 +82,27 @@ class LocalWorker:
 
         if request_type == "shutdown":
             return {"id": request_id, "ok": True}, False
+        if request_type == "preload":
+            return self._handle_preload(request, request_id), True
         if request_type != "generate":
             raise WorkerError("unknown_request", "未対応のrequest typeです。")
 
         return self._handle_generate(request, request_id), True
+
+    def _handle_preload(self, request: dict[str, Any], request_id: str) -> dict[str, Any]:
+        reference_audio = _validate_reference_audio(request.get("reference_audio"))
+        output_dir = _validate_output_dir(request.get("output_dir"))
+        already_loaded = self.engine is not None
+
+        self._log(request_id, "preload_start")
+        self._ensure_engine(reference_audio, output_dir)
+        self._log(request_id, "preload_ok")
+        return {
+            "id": request_id,
+            "ok": True,
+            "ready": True,
+            "already_loaded": already_loaded,
+        }
 
     def _handle_generate(self, request: dict[str, Any], request_id: str) -> dict[str, Any]:
         text = _validate_text(request.get("text"))
@@ -253,6 +270,16 @@ def _validate_output_path(value: Any) -> Path:
         raise WorkerError("invalid_request", "output_pathはfile pathを指定してください。")
     if not path.name:
         raise WorkerError("invalid_request", "output_pathはfile pathを指定してください。")
+    return path
+
+
+def _validate_output_dir(value: Any) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise WorkerError("invalid_request", "output_dirを指定してください。")
+
+    path = Path(value).expanduser().resolve(strict=False)
+    if path.exists() and not path.is_dir():
+        raise WorkerError("invalid_request", "output_dirはdirectory pathを指定してください。")
     return path
 
 

@@ -13,6 +13,7 @@ from voice_engine import VoiceGenerationResult, VoiceGenerationSettings
 class FakeVoiceEngine:
     instances: list[FakeVoiceEngine] = []
     fail_load = False
+    fail_load_count = 0
 
     def __init__(self, reference_audio: Path, output_dir: Path) -> None:
         self.reference_audio = reference_audio
@@ -26,7 +27,9 @@ class FakeVoiceEngine:
     def load(self) -> None:
         self.load_count += 1
         print("load stdout log")
-        if self.fail_load:
+        if self.fail_load or self.fail_load_count > 0:
+            if self.fail_load_count > 0:
+                FakeVoiceEngine.fail_load_count -= 1
             raise RuntimeError("load failed")
 
     def generate(
@@ -59,6 +62,186 @@ class LocalWorkerTest(unittest.TestCase):
     def setUp(self) -> None:
         FakeVoiceEngine.instances = []
         FakeVoiceEngine.fail_load = False
+        FakeVoiceEngine.fail_load_count = 0
+
+    def test_preload_loads_engine_without_generating(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+
+            response = self._single_response(
+                self._preload_request(
+                    "preload-1",
+                    reference_audio=reference,
+                    output_dir=base_dir / "outputs",
+                )
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "id": "preload-1",
+                "ok": True,
+                "ready": True,
+                "already_loaded": False,
+            },
+        )
+        self.assertEqual(len(FakeVoiceEngine.instances), 1)
+        self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
+        self.assertEqual(FakeVoiceEngine.instances[0].generate_calls, [])
+
+    def test_duplicate_preload_does_not_reload_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+            request = self._preload_request(
+                "preload-1",
+                reference_audio=reference,
+                output_dir=base_dir / "outputs",
+            )
+
+            responses, _stderr = self._run(
+                [
+                    request,
+                    {**request, "id": "preload-2"},
+                ]
+            )
+
+        self.assertFalse(responses[0]["already_loaded"])
+        self.assertTrue(responses[1]["already_loaded"])
+        self.assertEqual(len(FakeVoiceEngine.instances), 1)
+        self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
+
+    def test_generate_after_preload_reuses_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+            output_path = base_dir / "reply.wav"
+
+            responses, _stderr = self._run(
+                [
+                    self._preload_request(
+                        "preload-1",
+                        reference_audio=reference,
+                        output_dir=base_dir / "outputs",
+                    ),
+                    self._generate_request(
+                        "request-1",
+                        reference_audio=reference,
+                        output_path=output_path,
+                    ),
+                ]
+            )
+
+        self.assertTrue(all(response["ok"] for response in responses))
+        self.assertEqual(len(FakeVoiceEngine.instances), 1)
+        self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
+        self.assertEqual(len(FakeVoiceEngine.instances[0].generate_calls), 1)
+
+    def test_generate_retries_load_after_preload_failure(self) -> None:
+        FakeVoiceEngine.fail_load_count = 1
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+
+            responses, _stderr = self._run(
+                [
+                    self._preload_request(
+                        "preload-1",
+                        reference_audio=reference,
+                        output_dir=base_dir / "outputs",
+                    ),
+                    self._generate_request(
+                        "request-1",
+                        reference_audio=reference,
+                        output_path=base_dir / "reply.wav",
+                    ),
+                ]
+            )
+
+        self.assertEqual(responses[0]["error"]["code"], "model_load_failed")
+        self.assertTrue(responses[1]["ok"])
+        self.assertEqual(len(FakeVoiceEngine.instances), 2)
+        self.assertEqual([engine.load_count for engine in FakeVoiceEngine.instances], [1, 1])
+        self.assertEqual(FakeVoiceEngine.instances[0].generate_calls, [])
+        self.assertEqual(len(FakeVoiceEngine.instances[1].generate_calls), 1)
+
+    def test_shutdown_after_preload_returns_success_and_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+
+            responses, _stderr = self._run(
+                [
+                    self._preload_request(
+                        "preload-1",
+                        reference_audio=reference,
+                        output_dir=base_dir / "outputs",
+                    ),
+                    {"id": "shutdown-1", "type": "shutdown"},
+                    {"id": "request-1", "type": "ping"},
+                ]
+            )
+
+        self.assertEqual([response["id"] for response in responses], ["preload-1", "shutdown-1"])
+        self.assertTrue(all(response["ok"] for response in responses))
+
+    def test_preload_utf8_stdout_is_json_lines_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "参照音声.wav")
+            request = self._preload_request(
+                "事前読込-1",
+                reference_audio=reference,
+                output_dir=base_dir / "音声出力",
+            )
+            raw_input = (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+
+            raw_output, raw_stderr = self._run_protocol_bytes(raw_input, raw_output=True)
+
+        output_text = raw_output.decode("utf-8")
+        output_lines = output_text.splitlines()
+        self.assertEqual(len(output_lines), 1)
+        self.assertEqual(json.loads(output_lines[0])["id"], "事前読込-1")
+        self.assertNotIn("stdout log", output_text)
+        stderr = raw_stderr.decode("utf-8")
+        self.assertIn("factory stdout log", stderr)
+        self.assertIn("load stdout log", stderr)
+
+    def test_malformed_preload_fields_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = self._write_audio(base_dir / "reference.wav")
+            output_file = base_dir / "not-a-directory"
+            output_file.write_text("file", encoding="utf-8")
+            cases = [
+                ({"id": "preload-1", "type": "preload", "output_dir": str(base_dir)}, "missing_reference"),
+                (
+                    {
+                        "id": "preload-2",
+                        "type": "preload",
+                        "reference_audio": str(reference),
+                    },
+                    "invalid_request",
+                ),
+                (
+                    {
+                        "id": "preload-3",
+                        "type": "preload",
+                        "reference_audio": str(reference),
+                        "output_dir": str(output_file),
+                    },
+                    "invalid_request",
+                ),
+            ]
+
+            for request, expected_code in cases:
+                with self.subTest(request_id=request["id"]):
+                    response = self._single_response(request)
+                    self.assertFalse(response["ok"])
+                    self.assertEqual(response["error"]["code"], expected_code)
+
+        self.assertEqual(FakeVoiceEngine.instances, [])
 
     def test_valid_generate_returns_json_response(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -462,6 +645,20 @@ class LocalWorkerTest(unittest.TestCase):
         if settings is not None:
             request["settings"] = settings
         return request
+
+    def _preload_request(
+        self,
+        request_id: str,
+        *,
+        reference_audio: Path,
+        output_dir: Path,
+    ) -> dict:
+        return {
+            "id": request_id,
+            "type": "preload",
+            "reference_audio": str(reference_audio),
+            "output_dir": str(output_dir),
+        }
 
     def _write_audio(self, path: Path) -> Path:
         path.write_bytes(b"dummy wav")
