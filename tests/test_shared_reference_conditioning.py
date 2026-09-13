@@ -871,6 +871,11 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         cls.adapter_modules_to_save = Path(cls.temp_dir.name) / "adapter-modules-to-save"
         cls.adapter_pissa = Path(cls.temp_dir.name) / "adapter-pissa"
         cls.adapter_olora = Path(cls.temp_dir.name) / "adapter-olora"
+        cls.adapter_default = Path(cls.temp_dir.name) / "adapter-default"
+        cls.adapter_false = Path(cls.temp_dir.name) / "adapter-false"
+        cls.adapter_gaussian = Path(cls.temp_dir.name) / "adapter-gaussian"
+        cls.adapter_eva = Path(cls.temp_dir.name) / "adapter-eva"
+        cls.adapter_orthogonal = Path(cls.temp_dir.name) / "adapter-orthogonal"
         cls._save_adapter(cls.adapter_a, scale=0.10)
         cls._save_adapter(cls.adapter_b, scale=-0.15)
         cls._save_adapter(
@@ -893,6 +898,19 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         )
         cls._save_adapter(cls.adapter_pissa, scale=0.14, init_lora_weights="pissa")
         cls._save_adapter(cls.adapter_olora, scale=-0.18, init_lora_weights="olora")
+        cls._save_adapter(cls.adapter_default, scale=0.10)
+        default_config_path = cls.adapter_default / "adapter_config.json"
+        default_payload = json.loads(default_config_path.read_text(encoding="utf-8"))
+        default_payload.pop("init_lora_weights")
+        default_config_path.write_text(json.dumps(default_payload), encoding="utf-8")
+        cls._save_adapter(cls.adapter_false, scale=0.11, init_lora_weights=False)
+        cls._save_adapter(cls.adapter_gaussian, scale=0.12, init_lora_weights="gaussian")
+        cls._save_adapter(cls.adapter_eva, scale=0.13, init_lora_weights="eva")
+        cls._save_adapter(
+            cls.adapter_orthogonal,
+            scale=0.14,
+            init_lora_weights="orthogonal",
+        )
         cls.ref_latent = torch.randn((1, 6, 2))
         cls.ref_mask = torch.tensor([[True, True, True, True, True, False]])
 
@@ -976,6 +994,16 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
 
     def _runtime(self) -> InferenceRuntime:
         return _make_real_runtime(cfg=self.cfg, state_dict=self.base_state)
+
+    def _stub_adapter(self, name: str, payload: dict[str, object]) -> Path:
+        adapter = Path(self.temp_dir.name) / name
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+        (adapter / "adapter_model.safetensors").touch()
+        return adapter
 
     def _prepare(
         self,
@@ -1130,6 +1158,80 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
                         "can persistently modify shared base parameters",
                     ):
                         lora_adapter_mutates_base_parameters(adapter)
+
+    def test_canonical_dynamic_initializations_reach_real_peft_loader(self) -> None:
+        adapters = (
+            self.adapter_default,
+            self.adapter_a,
+            self.adapter_false,
+            self.adapter_gaussian,
+            self.adapter_eva,
+            self.adapter_orthogonal,
+        )
+        for adapter in adapters:
+            with self.subTest(adapter=adapter.name):
+                runtime = self._runtime()
+                prepared = self._prepare(runtime, adapter)
+
+                self.assertIn(str(adapter.resolve()), runtime._lora_adapter_names)
+                self.assertIsNone(runtime._lora_load_failure)
+                self._synthesize_prepared(runtime, prepared, adapter)
+
+    def test_noncanonical_peft_values_are_rejected_without_runtime_mutation(self) -> None:
+        cases = (
+            ("noncanonical-eva", {"bias": "none", "init_lora_weights": "EVA"}),
+            (
+                "noncanonical-orthogonal",
+                {"bias": "none", "init_lora_weights": "ORTHOGONAL"},
+            ),
+            (
+                "noncanonical-gaussian",
+                {"bias": "none", "init_lora_weights": " gaussian "},
+            ),
+            ("noncanonical-bias", {"bias": "ALL"}),
+        )
+        for name, payload in cases:
+            with self.subTest(name=name):
+                adapter = self._stub_adapter(name, payload)
+                runtime = self._runtime()
+                base_before = self._prepare(runtime, None)
+                model_before = runtime.model
+
+                with patch(
+                    "irodori_tts.inference_runtime.load_lora_adapter",
+                    side_effect=AssertionError("invalid adapter must not reach PEFT loading"),
+                ) as loader:
+                    with self.assertRaisesRegex(ValueError, "Unsupported LoRA adapter"):
+                        self._prepare(runtime, adapter)
+
+                loader.assert_not_called()
+                self.assertIs(runtime.model, model_before)
+                self.assertEqual(runtime._effective_conditioning_state_revision, 0)
+                self.assertEqual(runtime._lora_adapter_names, {})
+                self.assertIsNone(runtime._lora_load_failure)
+                self._synthesize_prepared(runtime, base_before, None)
+
+                valid_prepared = self._prepare(runtime, self.adapter_a)
+                self._synthesize_prepared(runtime, valid_prepared, self.adapter_a)
+
+    def test_invalid_preflight_value_types_and_unknown_strings_are_rejected(self) -> None:
+        cases = (
+            ("init-null", {"bias": "none", "init_lora_weights": None}),
+            ("init-number", {"bias": "none", "init_lora_weights": 1}),
+            ("init-list", {"bias": "none", "init_lora_weights": []}),
+            ("init-object", {"bias": "none", "init_lora_weights": {}}),
+            ("init-unknown", {"bias": "none", "init_lora_weights": "unknown"}),
+            ("bias-null", {"bias": None}),
+            ("bias-number", {"bias": 1}),
+            ("bias-list", {"bias": []}),
+            ("bias-object", {"bias": {}}),
+            ("bias-unknown", {"bias": "unknown"}),
+        )
+        for name, payload in cases:
+            with self.subTest(name=name):
+                adapter = self._stub_adapter(name, payload)
+                with self.assertRaisesRegex(ValueError, "Unsupported LoRA adapter"):
+                    lora_adapter_mutates_base_parameters(adapter)
 
     def test_base_mutating_initializations_are_rejected_before_runtime_mutation(self) -> None:
         for adapter in (self.adapter_pissa, self.adapter_olora):

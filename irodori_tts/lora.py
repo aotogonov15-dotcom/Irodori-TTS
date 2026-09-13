@@ -30,6 +30,11 @@ _SAFE_DYNAMIC_LORA_INITIALIZATIONS = {
     "eva",
     "orthogonal",
 }
+_SUPPORTED_LORA_BIASES = {
+    "none",
+    "all",
+    "lora_only",
+}
 _BASE_MUTATING_LORA_INITIALIZATIONS = {
     "olora",
     "corda",
@@ -265,20 +270,15 @@ def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
         raise ValueError(f"LoRA adapter config must contain a JSON object: {config_path}")
 
     raw_initialization = payload.get("init_lora_weights", True)
-    if isinstance(raw_initialization, bool):
-        initialization_is_safe = True
-        initialization = str(raw_initialization)
-    elif isinstance(raw_initialization, str):
-        initialization = raw_initialization.strip().lower()
-        initialization_is_safe = initialization in _SAFE_DYNAMIC_LORA_INITIALIZATIONS
-    else:
-        initialization = repr(raw_initialization)
-        initialization_is_safe = False
+    initialization_is_safe = isinstance(raw_initialization, bool) or (
+        isinstance(raw_initialization, str)
+        and raw_initialization in _SAFE_DYNAMIC_LORA_INITIALIZATIONS
+    )
 
-    mutates_base = (
-        initialization == "pissa"
-        or initialization.startswith("pissa_niter_")
-        or initialization in _BASE_MUTATING_LORA_INITIALIZATIONS
+    mutates_base = isinstance(raw_initialization, str) and (
+        raw_initialization == "pissa"
+        or raw_initialization.startswith("pissa_niter_")
+        or raw_initialization in _BASE_MUTATING_LORA_INITIALIZATIONS
     )
     if mutates_base:
         raise ValueError(
@@ -295,11 +295,11 @@ def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
             "be proven."
         )
 
-    bias = str(payload.get("bias", "none")).strip().lower()
-    if bias not in {"none", "all", "lora_only"}:
+    bias = payload.get("bias", "none")
+    if not isinstance(bias, str) or bias not in _SUPPORTED_LORA_BIASES:
         raise ValueError(
             f"Unsupported LoRA adapter bias={bias!r} in {config_path}. "
-            "Expected one of: none, all, lora_only."
+            "Expected an exact canonical value from: none, all, lora_only."
         )
     return bias != "none"
 
