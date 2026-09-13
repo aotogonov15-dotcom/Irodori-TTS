@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,8 +16,10 @@ from irodori_tts.inference_runtime import (
     PreparedReferenceConditioning,
     SamplingRequest,
 )
-from irodori_tts.model import TextToLatentRFDiT
+from irodori_tts.lora import apply_lora
+from irodori_tts.model import TextToLatentRFDiT, patch_sequence_with_mask
 from irodori_tts.rf import sample_euler_rf_cfg
+from irodori_tts.speaker_inversion import save_speaker_inversion_safetensors
 
 
 class _FakeTokenizer:
@@ -127,6 +131,67 @@ def _fake_sampler(**kwargs) -> torch.Tensor:
     )
 
 
+def _zero_sampler(**kwargs) -> torch.Tensor:
+    return torch.zeros(
+        (
+            kwargs["text_input_ids"].shape[0],
+            kwargs["sequence_length"],
+            kwargs["model"].cfg.patched_latent_dim,
+        ),
+        dtype=next(kwargs["model"].parameters()).dtype,
+    )
+
+
+def _small_model_config(*, use_duration_predictor: bool = False) -> ModelConfig:
+    return ModelConfig(
+        latent_dim=2,
+        latent_patch_size=1,
+        model_dim=8,
+        num_layers=1,
+        num_heads=2,
+        mlp_ratio=2.0,
+        text_mlp_ratio=2.0,
+        speaker_mlp_ratio=2.0,
+        dropout=0.0,
+        text_vocab_size=16,
+        text_dim=8,
+        text_layers=1,
+        text_heads=2,
+        use_speaker_condition=True,
+        speaker_dim=8,
+        speaker_layers=1,
+        speaker_heads=2,
+        timestep_embed_dim=8,
+        adaln_rank=4,
+        use_duration_predictor=use_duration_predictor,
+        duration_hidden_dim=8,
+        duration_layers=1,
+        duration_dropout=0.0,
+        duration_attention_heads=2,
+    )
+
+
+def _legacy_speaker_condition_oracle(
+    model: TextToLatentRFDiT,
+    ref_latent: torch.Tensor,
+    ref_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Test-only copy of the pre-B1 reference path from Base 47b62bd."""
+    patched, patched_mask = patch_sequence_with_mask(
+        seq=ref_latent,
+        mask=ref_mask,
+        patch_size=model.cfg.speaker_patch_size,
+    )
+    state = model.speaker_encoder(patched, patched_mask)
+    state = model.speaker_norm(state)
+    mask_f = patched_mask.unsqueeze(-1).to(dtype=state.dtype)
+    mean = (state * mask_f).sum(dim=1, keepdim=True) / mask_f.sum(
+        dim=1, keepdim=True
+    ).clamp_min(1.0)
+    has_any = patched_mask.any(dim=1, keepdim=True)
+    return torch.cat([mean, state], dim=1), torch.cat([has_any, patched_mask], dim=1)
+
+
 def _make_runtime() -> InferenceRuntime:
     runtime = object.__new__(InferenceRuntime)
     runtime.key = SimpleNamespace(
@@ -160,11 +225,50 @@ def _make_runtime() -> InferenceRuntime:
     return runtime
 
 
+def _make_real_runtime(
+    *,
+    cfg: ModelConfig,
+    state_dict: dict[str, torch.Tensor],
+) -> InferenceRuntime:
+    runtime = object.__new__(InferenceRuntime)
+    runtime.key = SimpleNamespace(
+        model_device="cpu",
+        model_precision="fp32",
+        codec_device="cpu",
+        codec_precision="fp32",
+        compile_model=False,
+    )
+    runtime.model_device = torch.device("cpu")
+    runtime.codec_device = torch.device("cpu")
+    runtime.model_cfg = cfg
+    runtime.train_cfg = None
+    runtime.model = TextToLatentRFDiT(cfg).eval()
+    runtime.model.load_state_dict(state_dict)
+    runtime.tokenizer = _FakeTokenizer()
+    runtime.caption_tokenizer = None
+    runtime.codec = _FakeCodec()
+    runtime.default_text_max_len = 16
+    runtime.default_caption_max_len = 16
+    runtime.watermarker = SimpleNamespace(ready=False)
+    runtime._infer_lock = threading.Lock()
+    runtime._model_dtype = torch.float32
+    runtime._lora_adapter_names = {}
+    return runtime
+
+
 class PreparedReferenceConditioningTest(unittest.TestCase):
+    def test_rejects_empty_speaker_token_sequence(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least one speaker token"):
+            PreparedReferenceConditioning(
+                torch.empty((1, 0, 8)),
+                torch.empty((1, 0), dtype=torch.bool),
+                _lora_adapter=None,
+            )
+
     def test_expands_batch_as_views_without_mutating_base_tensors(self) -> None:
         state = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
         mask = torch.tensor([[True, True, False, True]])
-        prepared = PreparedReferenceConditioning(state, mask)
+        prepared = PreparedReferenceConditioning(state, mask, _lora_adapter=None)
 
         expanded_state, expanded_mask = prepared.expanded(3)
 
@@ -247,11 +351,161 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
         torch.testing.assert_close(duration_mask, legacy_mask)
         torch.testing.assert_close(sampling_mask, legacy_mask)
 
+    def test_independent_base_oracle_covers_reference_no_ref_and_direct_inputs(self) -> None:
+        torch.manual_seed(17)
+        model = TextToLatentRFDiT(_small_model_config()).eval()
+        reference_cases = (
+            (
+                torch.randn((1, 6, 2)),
+                torch.tensor([[True, True, True, True, True, False]]),
+            ),
+            (
+                torch.zeros((1, 1, 2)),
+                torch.ones((1, 1), dtype=torch.bool),
+            ),
+        )
+
+        with torch.inference_mode():
+            for ref_latent, ref_mask in reference_cases:
+                expected_state, expected_mask = _legacy_speaker_condition_oracle(
+                    model, ref_latent, ref_mask
+                )
+                actual_state, actual_mask = model.encode_speaker_condition(
+                    ref_latent,
+                    ref_mask,
+                    batch_size=1,
+                )
+                torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+                torch.testing.assert_close(actual_mask, expected_mask)
+
+            direct_state = torch.randn((1, 3, 8))
+            direct_mask = torch.tensor([[True, False, True]])
+            actual_state, actual_mask = model.encode_speaker_condition(
+                None,
+                None,
+                batch_size=2,
+                speaker_state_override=direct_state,
+                speaker_mask_override=direct_mask,
+            )
+            torch.testing.assert_close(actual_state, direct_state.expand(2, -1, -1))
+            torch.testing.assert_close(actual_mask, direct_mask.expand(2, -1))
+
+    def test_independent_oracle_covers_speaker_inversion(self) -> None:
+        torch.manual_seed(19)
+        model = TextToLatentRFDiT(_small_model_config()).eval()
+        initial = torch.randn((3, 8))
+        model.enable_speaker_inversion(
+            num_tokens=3,
+            init_std=0.0,
+            init_embedding=initial,
+        )
+
+        with torch.inference_mode():
+            actual_state, actual_mask = model.encode_speaker_condition(
+                None,
+                None,
+                batch_size=2,
+            )
+
+        torch.testing.assert_close(actual_state, initial.unsqueeze(0).expand(2, -1, -1))
+        torch.testing.assert_close(actual_mask, torch.ones((2, 3), dtype=torch.bool))
+
+    def test_real_duration_and_rf_kv_paths_preserve_prepared_tensors_and_equivalence(self) -> None:
+        torch.manual_seed(23)
+        model = TextToLatentRFDiT(
+            _small_model_config(use_duration_predictor=True)
+        ).eval()
+        torch.nn.init.normal_(model.out_proj.weight, std=0.02)
+        ref_latent = torch.randn((1, 6, 2))
+        ref_mask = torch.tensor([[True, True, True, True, True, False]])
+        text_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        text_mask = torch.ones_like(text_ids, dtype=torch.bool)
+
+        with torch.inference_mode():
+            prepared_state, prepared_mask = model.encode_speaker_condition(
+                ref_latent,
+                ref_mask,
+                batch_size=1,
+            )
+            prepared = PreparedReferenceConditioning(
+                prepared_state.detach(),
+                prepared_mask.detach(),
+                _lora_adapter=None,
+            )
+            original_state = prepared.speaker_state.clone()
+            original_mask = prepared.speaker_mask.clone()
+
+            legacy_conditions = model.encode_conditions(
+                text_ids,
+                text_mask,
+                ref_latent,
+                ref_mask,
+            )
+            prepared_conditions = model.encode_conditions(
+                text_ids,
+                text_mask,
+                None,
+                None,
+                speaker_state_override=prepared.speaker_state,
+                speaker_mask_override=prepared.speaker_mask,
+            )
+            duration_kwargs = {
+                "duration_features": torch.zeros((1, model.cfg.duration_aux_dim)),
+                "has_speaker": torch.ones((1,), dtype=torch.bool),
+            }
+            legacy_duration = model.predict_duration_log_frames(
+                text_state=legacy_conditions[0],
+                text_mask=legacy_conditions[1],
+                speaker_state=legacy_conditions[2],
+                speaker_mask=legacy_conditions[3],
+                **duration_kwargs,
+            )
+            prepared_duration = model.predict_duration_log_frames(
+                text_state=prepared_conditions[0],
+                text_mask=prepared_conditions[1],
+                speaker_state=prepared_conditions[2],
+                speaker_mask=prepared_conditions[3],
+                **duration_kwargs,
+            )
+            legacy_sample = sample_euler_rf_cfg(
+                model=model,
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                sequence_length=2,
+                num_steps=2,
+                cfg_scale_text=3.0,
+                cfg_scale_speaker=5.0,
+                seed=29,
+                use_context_kv_cache=True,
+            )
+            prepared_sample = sample_euler_rf_cfg(
+                model=model,
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=None,
+                ref_mask=None,
+                sequence_length=2,
+                speaker_state_override=prepared.speaker_state,
+                speaker_mask_override=prepared.speaker_mask,
+                num_steps=2,
+                cfg_scale_text=3.0,
+                cfg_scale_speaker=5.0,
+                seed=29,
+                use_context_kv_cache=True,
+            )
+
+        torch.testing.assert_close(prepared_duration, legacy_duration, rtol=0, atol=0)
+        torch.testing.assert_close(prepared_sample, legacy_sample, rtol=0, atol=0)
+        torch.testing.assert_close(prepared.speaker_state, original_state, rtol=0, atol=0)
+        torch.testing.assert_close(prepared.speaker_mask, original_mask)
+
     def test_cfg_expansion_does_not_mutate_prepared_batch_views(self) -> None:
         model = _FakeModel()
         state = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
         mask = torch.tensor([[True, True, False, True]])
-        prepared = PreparedReferenceConditioning(state, mask)
+        prepared = PreparedReferenceConditioning(state, mask, _lora_adapter=None)
         expanded_state, expanded_mask = prepared.expanded(2)
         original_state = state.clone()
         original_mask = mask.clone()
@@ -347,6 +601,242 @@ class InferenceRuntimeSharedConditioningTest(unittest.TestCase):
         torch.testing.assert_close(prepared.speaker_state, original_state)
         torch.testing.assert_close(prepared.speaker_mask, original_mask)
         self.assertEqual(result.used_seed, 4321)
+
+
+class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        torch.manual_seed(31)
+        cls.cfg = _small_model_config(use_duration_predictor=True)
+        base_model = TextToLatentRFDiT(cls.cfg).eval()
+        torch.nn.init.normal_(base_model.out_proj.weight, std=0.02)
+        cls.base_state = {
+            name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()
+        }
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.adapter_a = Path(cls.temp_dir.name) / "adapter-a"
+        cls.adapter_b = Path(cls.temp_dir.name) / "adapter-b"
+        cls._save_adapter(cls.adapter_a, scale=0.10)
+        cls._save_adapter(cls.adapter_b, scale=-0.15)
+        cls.ref_latent = torch.randn((1, 6, 2))
+        cls.ref_mask = torch.tensor([[True, True, True, True, True, False]])
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.temp_dir.cleanup()
+
+    @classmethod
+    def _save_adapter(cls, path: Path, *, scale: float) -> None:
+        model = TextToLatentRFDiT(cls.cfg).eval()
+        model.load_state_dict(cls.base_state)
+        peft_model = apply_lora(
+            model,
+            {
+                "lora_enabled": True,
+                "lora_r": 2,
+                "lora_alpha": 2,
+                "lora_dropout": 0.0,
+                "lora_bias": "none",
+                "lora_target_modules": r"^speaker_encoder\.in_proj$",
+                "lora_modules_to_save": "none",
+            },
+        )
+        touched = 0
+        with torch.no_grad():
+            for name, parameter in peft_model.named_parameters():
+                if "lora_A" in name:
+                    parameter.fill_(0.25)
+                    touched += 1
+                elif "lora_B" in name:
+                    parameter.fill_(scale)
+                    touched += 1
+        if touched == 0:
+            raise AssertionError("test adapter did not target the speaker encoder")
+        peft_model.save_pretrained(path)
+
+    def _runtime(self) -> InferenceRuntime:
+        return _make_real_runtime(cfg=self.cfg, state_dict=self.base_state)
+
+    def _prepare(
+        self,
+        runtime: InferenceRuntime,
+        adapter: str | Path | None,
+    ) -> PreparedReferenceConditioning:
+        with patch.object(
+            runtime,
+            "_load_reference_latent",
+            return_value=(self.ref_latent.clone(), self.ref_mask.clone()),
+        ):
+            return runtime.prepare_reference_conditioning(
+                lora_adapter=None if adapter is None else str(adapter)
+            )
+
+    def _synthesize_prepared(
+        self,
+        runtime: InferenceRuntime,
+        prepared: PreparedReferenceConditioning,
+        adapter: str | Path | None,
+    ) -> None:
+        request = SamplingRequest(
+            text="adapter consistency",
+            seconds=0.5,
+            min_seconds=0.5,
+            max_seconds=0.5,
+            num_steps=1,
+            seed=37,
+            trim_tail=False,
+            lora_adapter=None if adapter is None else str(adapter),
+        )
+        with patch("irodori_tts.inference_runtime.sample_euler_rf_cfg", _zero_sampler):
+            runtime.synthesize(request, prepared_reference=prepared)
+
+    def test_base_prepare_to_base_synthesize_passes(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, None)
+
+        self.assertIsNone(prepared._lora_adapter)
+        self._synthesize_prepared(runtime, prepared, None)
+
+    def test_same_lora_prepare_and_synthesize_passes(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, self.adapter_a)
+
+        self.assertEqual(prepared._lora_adapter, str(self.adapter_a.resolve()))
+        self._synthesize_prepared(runtime, prepared, self.adapter_a)
+
+    def test_mismatched_prepared_and_request_adapters_are_rejected(self) -> None:
+        runtime = self._runtime()
+        prepared_base = self._prepare(runtime, None)
+        prepared_a = self._prepare(runtime, self.adapter_a)
+
+        mismatch_cases = (
+            (prepared_a, None),
+            (prepared_base, self.adapter_a),
+            (prepared_a, self.adapter_b),
+        )
+        for prepared, adapter in mismatch_cases:
+            with self.subTest(prepared=prepared._lora_adapter, adapter=adapter):
+                with self.assertRaisesRegex(ValueError, "LoRA mismatch"):
+                    self._synthesize_prepared(runtime, prepared, adapter)
+
+    def test_explicit_base_prepare_ignores_prior_ambient_adapter(self) -> None:
+        runtime = self._runtime()
+        prepared_a = self._prepare(runtime, self.adapter_a)
+        prepared_base = self._prepare(runtime, None)
+        oracle_model = TextToLatentRFDiT(self.cfg).eval()
+        oracle_model.load_state_dict(self.base_state)
+
+        with torch.inference_mode():
+            expected_base, _ = _legacy_speaker_condition_oracle(
+                oracle_model, self.ref_latent, self.ref_mask
+            )
+
+        self.assertGreater(
+            (prepared_a.speaker_state - prepared_base.speaker_state).abs().max().item(),
+            1e-6,
+        )
+        torch.testing.assert_close(prepared_base.speaker_state, expected_base, rtol=0, atol=0)
+        self.assertIsNone(prepared_base._lora_adapter)
+
+    def test_base_prepare_failure_restores_prior_adapter_and_next_request_is_consistent(self) -> None:
+        runtime = self._runtime()
+        prepared_a = self._prepare(runtime, self.adapter_a)
+        adapter_name = runtime._lora_adapter_names[prepared_a._lora_adapter]
+
+        with (
+            patch.object(
+                runtime,
+                "_prepare_reference_conditioning_for_request",
+                side_effect=RuntimeError("expected preparation failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected preparation failure"),
+        ):
+            runtime.prepare_reference_conditioning(lora_adapter=None)
+
+        self.assertEqual(runtime.model.active_adapter, adapter_name)
+        prepared_base = self._prepare(runtime, None)
+        self.assertIsNone(prepared_base._lora_adapter)
+        self._synthesize_prepared(runtime, prepared_base, None)
+
+    def test_lora_prepare_failure_cannot_contaminate_next_explicit_base_request(self) -> None:
+        runtime = self._runtime()
+        oracle_model = TextToLatentRFDiT(self.cfg).eval()
+        oracle_model.load_state_dict(self.base_state)
+        with torch.inference_mode():
+            expected_base, _ = _legacy_speaker_condition_oracle(
+                oracle_model, self.ref_latent, self.ref_mask
+            )
+
+        with (
+            patch.object(
+                runtime,
+                "_prepare_reference_conditioning_for_request",
+                side_effect=RuntimeError("expected LoRA preparation failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected LoRA preparation failure"),
+        ):
+            runtime.prepare_reference_conditioning(lora_adapter=str(self.adapter_a))
+
+        prepared_base = self._prepare(runtime, None)
+        torch.testing.assert_close(prepared_base.speaker_state, expected_base, rtol=0, atol=0)
+        self._synthesize_prepared(runtime, prepared_base, None)
+
+    def test_base_lora_base_lora_base_sequence_is_explicit(self) -> None:
+        runtime = self._runtime()
+        base_first = self._prepare(runtime, None)
+        prepared_a = self._prepare(runtime, self.adapter_a)
+        base_middle = self._prepare(runtime, None)
+        prepared_b = self._prepare(runtime, self.adapter_b)
+        base_last = self._prepare(runtime, None)
+
+        torch.testing.assert_close(base_middle.speaker_state, base_first.speaker_state, rtol=0, atol=0)
+        torch.testing.assert_close(base_last.speaker_state, base_first.speaker_state, rtol=0, atol=0)
+        self.assertGreater(
+            (prepared_a.speaker_state - prepared_b.speaker_state).abs().max().item(),
+            1e-6,
+        )
+
+    def test_ref_embed_preparation_bypasses_speaker_encoder(self) -> None:
+        runtime = self._runtime()
+        embedding = torch.randn((3, self.cfg.speaker_dim))
+        path = Path(self.temp_dir.name) / "reference.speaker.safetensors"
+        save_speaker_inversion_safetensors(path, {"speaker_embedding": embedding})
+
+        with patch.object(
+            runtime.model.speaker_encoder,
+            "forward",
+            wraps=runtime.model.speaker_encoder.forward,
+        ) as speaker_forward:
+            prepared = runtime.prepare_reference_conditioning(ref_embed=str(path))
+
+        self.assertEqual(speaker_forward.call_count, 0)
+        torch.testing.assert_close(prepared.speaker_state, embedding.unsqueeze(0), rtol=0, atol=0)
+        torch.testing.assert_close(prepared.speaker_mask, torch.ones((1, 3), dtype=torch.bool))
+
+    def test_ordinary_wav_synthesize_under_lora_uses_one_consistent_adapter(self) -> None:
+        runtime = self._runtime()
+        request = SamplingRequest(
+            text="ordinary wav lora",
+            ref_wav="reference.wav",
+            ref_normalize_db=None,
+            seconds=None,
+            min_seconds=0.5,
+            max_seconds=1.0,
+            num_steps=1,
+            seed=41,
+            trim_tail=False,
+            lora_adapter=str(self.adapter_a),
+        )
+
+        with patch(
+            "irodori_tts.inference_runtime._load_audio",
+            return_value=(torch.zeros((1, 8)), 4),
+        ):
+            result = runtime.synthesize(request)
+
+        self.assertEqual(runtime.codec.encode_count, 1)
+        self.assertEqual(result.used_seed, 41)
+        self.assertEqual(result.audio.shape, (1, 4))
 
 
 if __name__ == "__main__":

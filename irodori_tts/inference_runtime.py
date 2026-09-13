@@ -196,6 +196,7 @@ class PreparedReferenceConditioning:
 
     speaker_state: torch.Tensor | None
     speaker_mask: torch.Tensor | None
+    _lora_adapter: str | None
 
     def __post_init__(self) -> None:
         state = self.speaker_state
@@ -210,6 +211,8 @@ class PreparedReferenceConditioning:
             raise ValueError(
                 f"Prepared speaker_state must have shape (1,S,D), got {tuple(state.shape)}"
             )
+        if state.shape[1] == 0:
+            raise ValueError("Prepared speaker_state must contain at least one speaker token.")
         if mask.ndim != 2 or mask.shape[0] != 1:
             raise ValueError(
                 f"Prepared speaker_mask must have shape (1,S), got {tuple(mask.shape)}"
@@ -662,17 +665,17 @@ class InferenceRuntime:
 
     def _prepare_lora_for_request(
         self,
-        adapter_path: str | None,
+        resolved_adapter_path: str | None,
         *,
         messages: list[str],
         stage_timings: list[tuple[str, float]],
         log_fn: Callable[[str], None],
     ) -> Any:
-        should_time = adapter_path is not None and str(adapter_path).strip() != ""
+        should_time = resolved_adapter_path is not None
         t0 = _measure_start(self.model_device) if should_time else None
         try:
             return self._prepare_lora_for_request_inner(
-                adapter_path,
+                resolved_adapter_path,
                 messages=messages,
                 log_fn=log_fn,
             )
@@ -684,13 +687,12 @@ class InferenceRuntime:
 
     def _prepare_lora_for_request_inner(
         self,
-        adapter_path: str | None,
+        resolved_adapter_path: str | None,
         *,
         messages: list[str],
         log_fn: Callable[[str], None],
     ) -> Any:
-        resolved_path = self._resolve_lora_adapter_path(adapter_path)
-        if resolved_path is None:
+        if resolved_adapter_path is None:
             disable_adapter = getattr(self.model, "disable_adapter", None)
             if callable(disable_adapter):
                 msg = "info: dynamic LoRA disabled for this request; using base model."
@@ -702,25 +704,25 @@ class InferenceRuntime:
         if self.key.compile_model:
             raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
 
-        adapter_name = self._lora_adapter_names.get(resolved_path)
+        adapter_name = self._lora_adapter_names.get(resolved_adapter_path)
         if adapter_name is None:
-            adapter_name = self._adapter_name_for_path(resolved_path)
-            msg = f"info: loading LoRA adapter: {resolved_path}"
+            adapter_name = self._adapter_name_for_path(resolved_adapter_path)
+            msg = f"info: loading LoRA adapter: {resolved_adapter_path}"
             messages.append(msg)
             log_fn(msg)
         else:
-            msg = f"info: using cached LoRA adapter: {resolved_path}"
+            msg = f"info: using cached LoRA adapter: {resolved_adapter_path}"
             messages.append(msg)
             log_fn(msg)
 
         self.model = load_lora_adapter(
             self.model,
-            resolved_path,
+            resolved_adapter_path,
             is_trainable=False,
             adapter_name=adapter_name,
             torch_device=str(self.model_device),
         )
-        self._lora_adapter_names[resolved_path] = adapter_name
+        self._lora_adapter_names[resolved_adapter_path] = adapter_name
         self.model = _move_inference_module(
             self.model,
             device=self.model_device,
@@ -868,6 +870,7 @@ class InferenceRuntime:
         *,
         req: SamplingRequest,
         messages: list[str],
+        effective_lora_adapter: str | None,
     ) -> PreparedReferenceConditioning:
         speaker_state_override, speaker_mask_override = self._load_speaker_embedding_condition(
             req=req,
@@ -898,6 +901,7 @@ class InferenceRuntime:
         return PreparedReferenceConditioning(
             speaker_state=speaker_state,
             speaker_mask=speaker_mask,
+            _lora_adapter=effective_lora_adapter,
         )
 
     def prepare_reference_conditioning(
@@ -910,6 +914,7 @@ class InferenceRuntime:
         ref_normalize_db: float | None = -16.0,
         ref_ensure_max: bool = True,
         max_ref_seconds: float | None = 30.0,
+        lora_adapter: str | None = None,
         log_fn: Callable[[str], None] | None = None,
     ) -> PreparedReferenceConditioning:
         """Prepare reusable speaker/style conditioning without text or sampling state."""
@@ -922,17 +927,52 @@ class InferenceRuntime:
             ref_normalize_db=ref_normalize_db,
             ref_ensure_max=ref_ensure_max,
             max_ref_seconds=max_ref_seconds,
+            lora_adapter=lora_adapter,
         )
         messages: list[str] = []
-        with self._infer_lock, torch.inference_mode():
+        stage_timings: list[tuple[str, float]] = []
+        effective_lora_adapter = self._resolve_lora_adapter_path(lora_adapter)
+
+        def _log(message: str) -> None:
+            if log_fn is not None:
+                log_fn(message)
+
+        with (
+            self._infer_lock,
+            self._prepare_lora_for_request(
+                effective_lora_adapter,
+                messages=messages,
+                stage_timings=stage_timings,
+                log_fn=_log,
+            ),
+            torch.inference_mode(),
+        ):
+            msg_count_before_ref = len(messages)
             prepared = self._prepare_reference_conditioning_for_request(
                 req=req,
                 messages=messages,
+                effective_lora_adapter=effective_lora_adapter,
             )
         if log_fn is not None:
-            for message in messages:
+            for message in messages[msg_count_before_ref:]:
                 log_fn(message)
         return prepared
+
+    @staticmethod
+    def _validate_prepared_lora_adapter(
+        prepared: PreparedReferenceConditioning,
+        *,
+        effective_lora_adapter: str | None,
+    ) -> None:
+        if prepared._lora_adapter == effective_lora_adapter:
+            return
+        prepared_label = prepared._lora_adapter or "base model"
+        requested_label = effective_lora_adapter or "base model"
+        raise ValueError(
+            "Prepared reference conditioning LoRA mismatch: "
+            f"prepared with {prepared_label!r}, but synthesis requested {requested_label!r}. "
+            "Prepare the reference again with the same lora_adapter."
+        )
 
     def _expand_prepared_reference(
         self,
@@ -1033,6 +1073,12 @@ class InferenceRuntime:
             raise ValueError(
                 "prepared_reference cannot be combined with ref_wav/ref_latent/ref_embed/no_ref."
             )
+        effective_lora_adapter = self._resolve_lora_adapter_path(req.lora_adapter)
+        if prepared_reference is not None:
+            self._validate_prepared_lora_adapter(
+                prepared_reference,
+                effective_lora_adapter=effective_lora_adapter,
+            )
 
         raw_text = str(req.text)
         normalized_text = normalize_text(raw_text).strip()
@@ -1131,7 +1177,7 @@ class InferenceRuntime:
         with (
             self._infer_lock,
             self._prepare_lora_for_request(
-                req.lora_adapter,
+                effective_lora_adapter,
                 messages=messages,
                 stage_timings=stage_timings,
                 log_fn=_log,
@@ -1171,6 +1217,7 @@ class InferenceRuntime:
                 active_prepared_reference = self._prepare_reference_conditioning_for_request(
                     req=req,
                     messages=messages,
+                    effective_lora_adapter=effective_lora_adapter,
                 )
             else:
                 active_prepared_reference = prepared_reference
