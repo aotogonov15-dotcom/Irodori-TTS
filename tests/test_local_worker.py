@@ -14,8 +14,9 @@ class FakeVoiceEngine:
     instances: list[FakeVoiceEngine] = []
     fail_load = False
     fail_load_count = 0
+    load_error: BaseException | None = None
 
-    def __init__(self, reference_audio: Path, output_dir: Path) -> None:
+    def __init__(self, reference_audio: Path | None, output_dir: Path) -> None:
         self.reference_audio = reference_audio
         self.output_dir = output_dir
         self.load_count = 0
@@ -27,6 +28,8 @@ class FakeVoiceEngine:
     def load(self) -> None:
         self.load_count += 1
         print("load stdout log")
+        if self.load_error is not None:
+            raise self.load_error
         if self.fail_load or self.fail_load_count > 0:
             if self.fail_load_count > 0:
                 FakeVoiceEngine.fail_load_count -= 1
@@ -63,6 +66,7 @@ class LocalWorkerTest(unittest.TestCase):
         FakeVoiceEngine.instances = []
         FakeVoiceEngine.fail_load = False
         FakeVoiceEngine.fail_load_count = 0
+        FakeVoiceEngine.load_error = None
 
     def test_preload_loads_engine_without_generating(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,15 +94,53 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
         self.assertEqual(FakeVoiceEngine.instances[0].generate_calls, [])
 
+    def test_preload_without_reference_loads_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "outputs"
+
+            response = self._single_response(
+                {
+                    "id": "preload-1",
+                    "type": "preload",
+                    "output_dir": str(output_dir),
+                }
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "id": "preload-1",
+                "ok": True,
+                "ready": True,
+                "already_loaded": False,
+            },
+        )
+        self.assertEqual(len(FakeVoiceEngine.instances), 1)
+        self.assertIsNone(FakeVoiceEngine.instances[0].reference_audio)
+        self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
+
+    def test_preload_with_null_reference_loads_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response = self._single_response(
+                {
+                    "id": "preload-1",
+                    "type": "preload",
+                    "reference_audio": None,
+                    "output_dir": str(Path(temp_dir) / "outputs"),
+                }
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertIsNone(FakeVoiceEngine.instances[0].reference_audio)
+
     def test_duplicate_preload_does_not_reload_engine(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir)
-            reference = self._write_audio(base_dir / "reference.wav")
-            request = self._preload_request(
-                "preload-1",
-                reference_audio=reference,
-                output_dir=base_dir / "outputs",
-            )
+            request = {
+                "id": "preload-1",
+                "type": "preload",
+                "output_dir": str(base_dir / "outputs"),
+            }
 
             responses, _stderr = self._run(
                 [
@@ -120,11 +162,11 @@ class LocalWorkerTest(unittest.TestCase):
 
             responses, _stderr = self._run(
                 [
-                    self._preload_request(
-                        "preload-1",
-                        reference_audio=reference,
-                        output_dir=base_dir / "outputs",
-                    ),
+                    {
+                        "id": "preload-1",
+                        "type": "preload",
+                        "output_dir": str(base_dir / "outputs"),
+                    },
                     self._generate_request(
                         "request-1",
                         reference_audio=reference,
@@ -136,6 +178,7 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertTrue(all(response["ok"] for response in responses))
         self.assertEqual(len(FakeVoiceEngine.instances), 1)
         self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
+        self.assertIsNone(FakeVoiceEngine.instances[0].reference_audio)
         self.assertEqual(len(FakeVoiceEngine.instances[0].generate_calls), 1)
 
     def test_generate_retries_load_after_preload_failure(self) -> None:
@@ -146,11 +189,11 @@ class LocalWorkerTest(unittest.TestCase):
 
             responses, _stderr = self._run(
                 [
-                    self._preload_request(
-                        "preload-1",
-                        reference_audio=reference,
-                        output_dir=base_dir / "outputs",
-                    ),
+                    {
+                        "id": "preload-1",
+                        "type": "preload",
+                        "output_dir": str(base_dir / "outputs"),
+                    },
                     self._generate_request(
                         "request-1",
                         reference_audio=reference,
@@ -165,6 +208,34 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertEqual([engine.load_count for engine in FakeVoiceEngine.instances], [1, 1])
         self.assertEqual(FakeVoiceEngine.instances[0].generate_calls, [])
         self.assertEqual(len(FakeVoiceEngine.instances[1].generate_calls), 1)
+
+    def test_codec_preload_failure_is_reported_as_model_load_failure(self) -> None:
+        FakeVoiceEngine.load_error = ValueError("codec load failed")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response = self._single_response(
+                {
+                    "id": "preload-1",
+                    "type": "preload",
+                    "output_dir": str(Path(temp_dir) / "outputs"),
+                }
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "model_load_failed")
+
+    def test_cuda_preload_failure_is_reported_as_cuda_failure(self) -> None:
+        FakeVoiceEngine.load_error = RuntimeError("CUDA out of memory")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response = self._single_response(
+                {
+                    "id": "preload-1",
+                    "type": "preload",
+                    "output_dir": str(Path(temp_dir) / "outputs"),
+                }
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "cuda_failed")
 
     def test_shutdown_after_preload_returns_success_and_stops(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -185,6 +256,25 @@ class LocalWorkerTest(unittest.TestCase):
 
         self.assertEqual([response["id"] for response in responses], ["preload-1", "shutdown-1"])
         self.assertTrue(all(response["ok"] for response in responses))
+
+    def test_shutdown_after_preload_failure_returns_success_and_stops(self) -> None:
+        FakeVoiceEngine.fail_load = True
+        with tempfile.TemporaryDirectory() as temp_dir:
+            responses, _stderr = self._run(
+                [
+                    {
+                        "id": "preload-1",
+                        "type": "preload",
+                        "output_dir": str(Path(temp_dir) / "outputs"),
+                    },
+                    {"id": "shutdown-1", "type": "shutdown"},
+                    {"id": "request-1", "type": "ping"},
+                ]
+            )
+
+        self.assertEqual([response["id"] for response in responses], ["preload-1", "shutdown-1"])
+        self.assertEqual(responses[0]["error"]["code"], "model_load_failed")
+        self.assertTrue(responses[1]["ok"])
 
     def test_preload_utf8_stdout_is_json_lines_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -215,10 +305,9 @@ class LocalWorkerTest(unittest.TestCase):
             output_file = base_dir / "not-a-directory"
             output_file.write_text("file", encoding="utf-8")
             cases = [
-                ({"id": "preload-1", "type": "preload", "output_dir": str(base_dir)}, "missing_reference"),
                 (
                     {
-                        "id": "preload-2",
+                        "id": "preload-1",
                         "type": "preload",
                         "reference_audio": str(reference),
                     },
@@ -226,12 +315,30 @@ class LocalWorkerTest(unittest.TestCase):
                 ),
                 (
                     {
-                        "id": "preload-3",
+                        "id": "preload-2",
                         "type": "preload",
                         "reference_audio": str(reference),
                         "output_dir": str(output_file),
                     },
                     "invalid_request",
+                ),
+                (
+                    {
+                        "id": "preload-3",
+                        "type": "preload",
+                        "reference_audio": "",
+                        "output_dir": str(base_dir),
+                    },
+                    "missing_reference",
+                ),
+                (
+                    {
+                        "id": "preload-4",
+                        "type": "preload",
+                        "reference_audio": str(base_dir / "missing.wav"),
+                        "output_dir": str(base_dir),
+                    },
+                    "missing_reference",
                 ),
             ]
 

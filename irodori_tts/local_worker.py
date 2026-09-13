@@ -15,7 +15,7 @@ from irodori_tts.voice_engine import (
 )
 
 
-EngineFactory = Callable[[Path, Path], Any]
+EngineFactory = Callable[[Path | None, Path], Any]
 
 _SETTINGS_TYPES: dict[str, type | tuple[type, ...]] = {
     "num_steps": int,
@@ -90,7 +90,7 @@ class LocalWorker:
         return self._handle_generate(request, request_id), True
 
     def _handle_preload(self, request: dict[str, Any], request_id: str) -> dict[str, Any]:
-        reference_audio = _validate_reference_audio(request.get("reference_audio"))
+        reference_audio = _validate_optional_reference_audio(request.get("reference_audio"))
         output_dir = _validate_output_dir(request.get("output_dir"))
         already_loaded = self.engine is not None
 
@@ -155,7 +155,7 @@ class LocalWorker:
             "generation_seconds": generation_seconds,
         }
 
-    def _ensure_engine(self, reference_audio: Path, output_dir: Path) -> Any:
+    def _ensure_engine(self, reference_audio: Path | None, output_dir: Path) -> Any:
         if self.engine is not None:
             return self.engine
 
@@ -259,6 +259,12 @@ def _validate_reference_audio(value: Any) -> Path:
     if not path.is_file():
         raise WorkerError("missing_reference", "参照音声ファイルが見つかりません。")
     return path
+
+
+def _validate_optional_reference_audio(value: Any) -> Path | None:
+    if value is None:
+        return None
+    return _validate_reference_audio(value)
 
 
 def _validate_output_path(value: Any) -> Path:

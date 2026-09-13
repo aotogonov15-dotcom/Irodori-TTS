@@ -23,6 +23,99 @@ class FakeRuntime:
         )
 
 
+class VoiceEngineLoadTest(unittest.TestCase):
+    def test_load_without_reference_initializes_global_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            output_dir = base_dir / "outputs"
+            runtime = object()
+
+            with (
+                patch(
+                    "irodori_tts.voice_engine.hf_hub_download",
+                    return_value=str(base_dir / "model.safetensors"),
+                ),
+                patch(
+                    "irodori_tts.voice_engine.InferenceRuntime.from_key",
+                    return_value=runtime,
+                ) as from_key,
+            ):
+                engine = VoiceEngine(None, output_dir)
+                engine.load()
+
+            self.assertTrue(output_dir.is_dir())
+            self.assertIs(engine._runtime, runtime)
+            self.assertTrue(engine.is_loaded)
+            self.assertEqual(from_key.call_count, 1)
+
+    def test_load_without_reference_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+
+            with (
+                patch(
+                    "irodori_tts.voice_engine.hf_hub_download",
+                    return_value=str(base_dir / "model.safetensors"),
+                ) as download,
+                patch(
+                    "irodori_tts.voice_engine.InferenceRuntime.from_key",
+                    return_value=object(),
+                ) as from_key,
+            ):
+                engine = VoiceEngine(None, base_dir / "outputs")
+                engine.load()
+                engine.load()
+
+            self.assertEqual(download.call_count, 1)
+            self.assertEqual(from_key.call_count, 1)
+
+    def test_generate_requires_reference_after_reference_less_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = VoiceEngine(None, Path(temp_dir) / "outputs")
+            engine._runtime = FakeRuntime()
+
+            with self.assertRaisesRegex(FileNotFoundError, "参照音声"):
+                engine.generate("こんにちは")
+
+    def test_generate_accepts_explicit_reference_after_reference_less_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            reference = base_dir / "reference.wav"
+            reference.write_bytes(b"dummy wav")
+            fake_runtime = FakeRuntime()
+            engine = VoiceEngine(None, base_dir / "outputs")
+            engine._runtime = fake_runtime
+
+            with patch(
+                "irodori_tts.voice_engine.save_wav",
+                return_value=base_dir / "generated.wav",
+            ):
+                engine.generate("こんにちは", reference_audio=reference)
+
+            self.assertEqual(fake_runtime.requests[0].ref_wav, str(reference))
+            self.assertIsNone(engine.reference_audio)
+
+    def test_load_failure_keeps_engine_unloaded_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+
+            with (
+                patch(
+                    "irodori_tts.voice_engine.hf_hub_download",
+                    return_value=str(base_dir / "model.safetensors"),
+                ),
+                patch(
+                    "irodori_tts.voice_engine.InferenceRuntime.from_key",
+                    side_effect=RuntimeError("codec load failed"),
+                ),
+            ):
+                engine = VoiceEngine(None, base_dir / "outputs")
+                with self.assertRaisesRegex(RuntimeError, "codec load failed"):
+                    engine.load()
+
+            self.assertFalse(engine.is_loaded)
+
+
 class VoiceEngineGenerateTest(unittest.TestCase):
     def test_default_settings_match_existing_sampling_values(self) -> None:
         settings = VoiceGenerationSettings()

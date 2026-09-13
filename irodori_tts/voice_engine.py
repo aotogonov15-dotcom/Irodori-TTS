@@ -59,10 +59,10 @@ class VoiceEngine:
 
     def __init__(
         self,
-        reference_audio: str | Path,
+        reference_audio: str | Path | None,
         output_dir: str | Path,
     ) -> None:
-        self.reference_audio = Path(reference_audio)
+        self.reference_audio = Path(reference_audio) if reference_audio is not None else None
         self.output_dir = Path(output_dir)
 
         self._runtime: InferenceRuntime | None = None
@@ -74,16 +74,10 @@ class VoiceEngine:
         return self._runtime is not None
 
     def load(self) -> None:
-        """モデルとCodecを読み込む。既に読み込み済みなら何もしない。"""
+        """参照音声に依存せずモデルとCodecを読み込む。読み込み済みなら何もしない。"""
 
         if self._runtime is not None:
             return
-
-        if not self.reference_audio.is_file():
-            raise FileNotFoundError(
-                "参照音声が見つかりません。\n"
-                f"確認する場所: {self.reference_audio}"
-            )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,7 +128,7 @@ class VoiceEngine:
             else self.reference_audio
         )
 
-        if not active_reference_audio.is_file():
+        if active_reference_audio is None or not active_reference_audio.is_file():
             raise FileNotFoundError(
                 "参照音声ファイルが見つかりません。\n"
                 f"確認する場所: {active_reference_audio}"
