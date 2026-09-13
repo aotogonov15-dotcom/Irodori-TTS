@@ -190,6 +190,69 @@ class RuntimeKey:
     compile_dynamic: bool = False
 
 
+@dataclass(frozen=True)
+class PreparedReferenceConditioning:
+    """Text-independent speaker/style state owned by one inference runtime."""
+
+    speaker_state: torch.Tensor | None
+    speaker_mask: torch.Tensor | None
+
+    def __post_init__(self) -> None:
+        state = self.speaker_state
+        mask = self.speaker_mask
+        if (state is None) != (mask is None):
+            raise ValueError(
+                "speaker_state and speaker_mask must either both be set or both be None."
+            )
+        if state is None:
+            return
+        if state.ndim != 3 or state.shape[0] != 1:
+            raise ValueError(
+                f"Prepared speaker_state must have shape (1,S,D), got {tuple(state.shape)}"
+            )
+        if mask.ndim != 2 or mask.shape[0] != 1:
+            raise ValueError(
+                f"Prepared speaker_mask must have shape (1,S), got {tuple(mask.shape)}"
+            )
+        if state.shape[1] != mask.shape[1]:
+            raise ValueError(
+                "Prepared speaker token mismatch: "
+                f"state={tuple(state.shape)} mask={tuple(mask.shape)}"
+            )
+        if mask.dtype != torch.bool:
+            raise ValueError(f"Prepared speaker_mask must be bool, got {mask.dtype}.")
+        if state.device != mask.device:
+            raise ValueError(
+                "Prepared speaker_state and speaker_mask must use the same device, "
+                f"got state={state.device} mask={mask.device}."
+            )
+
+    @property
+    def shape(self) -> tuple[int, ...] | None:
+        return None if self.speaker_state is None else tuple(self.speaker_state.shape)
+
+    @property
+    def device(self) -> torch.device | None:
+        return None if self.speaker_state is None else self.speaker_state.device
+
+    @property
+    def dtype(self) -> torch.dtype | None:
+        return None if self.speaker_state is None else self.speaker_state.dtype
+
+    def expanded(self, batch_size: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return read-only batch views; the prepared tensors themselves are never mutated."""
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        if self.speaker_state is None:
+            return None, None
+        if batch_size == 1:
+            return self.speaker_state, self.speaker_mask
+        return (
+            self.speaker_state.expand(batch_size, -1, -1),
+            self.speaker_mask.expand(batch_size, -1),
+        )
+
+
 @dataclass
 class SamplingRequest:
     text: str
@@ -800,11 +863,119 @@ class InferenceRuntime:
         )
         return state, mask
 
+    def _prepare_reference_conditioning_for_request(
+        self,
+        *,
+        req: SamplingRequest,
+        messages: list[str],
+    ) -> PreparedReferenceConditioning:
+        speaker_state_override, speaker_mask_override = self._load_speaker_embedding_condition(
+            req=req,
+            batch_size=1,
+            messages=messages,
+        )
+        if speaker_state_override is None:
+            ref_latent, ref_mask = self._load_reference_latent(
+                req=req,
+                batch_size=1,
+                messages=messages,
+            )
+        else:
+            ref_latent, ref_mask = None, None
+
+        speaker_state, speaker_mask = self.model.encode_speaker_condition(
+            ref_latent,
+            ref_mask,
+            batch_size=1,
+            speaker_state_override=speaker_state_override,
+            speaker_mask_override=speaker_mask_override,
+            device=self.model_device,
+            dtype=next(self.model.parameters()).dtype,
+        )
+        if speaker_state is not None:
+            speaker_state = speaker_state.detach()
+            speaker_mask = speaker_mask.detach()
+        return PreparedReferenceConditioning(
+            speaker_state=speaker_state,
+            speaker_mask=speaker_mask,
+        )
+
+    def prepare_reference_conditioning(
+        self,
+        *,
+        ref_wav: str | None = None,
+        ref_latent: str | None = None,
+        ref_embed: str | None = None,
+        no_ref: bool = False,
+        ref_normalize_db: float | None = -16.0,
+        ref_ensure_max: bool = True,
+        max_ref_seconds: float | None = 30.0,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> PreparedReferenceConditioning:
+        """Prepare reusable speaker/style conditioning without text or sampling state."""
+        req = SamplingRequest(
+            text="",
+            ref_wav=ref_wav,
+            ref_latent=ref_latent,
+            ref_embed=ref_embed,
+            no_ref=no_ref,
+            ref_normalize_db=ref_normalize_db,
+            ref_ensure_max=ref_ensure_max,
+            max_ref_seconds=max_ref_seconds,
+        )
+        messages: list[str] = []
+        with self._infer_lock, torch.inference_mode():
+            prepared = self._prepare_reference_conditioning_for_request(
+                req=req,
+                messages=messages,
+            )
+        if log_fn is not None:
+            for message in messages:
+                log_fn(message)
+        return prepared
+
+    def _expand_prepared_reference(
+        self,
+        prepared: PreparedReferenceConditioning,
+        *,
+        batch_size: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        state, mask = prepared.expanded(batch_size)
+        if not self.model_cfg.use_speaker_condition_resolved:
+            if state is not None:
+                raise ValueError(
+                    "Prepared reference conditioning was provided but speaker conditioning is disabled."
+                )
+            return None, None
+        if state is None or mask is None:
+            raise ValueError(
+                "Prepared reference conditioning has no speaker state for a speaker-conditioned model."
+            )
+        runtime_device = next(self.model.parameters()).device
+        runtime_dtype = next(self.model.parameters()).dtype
+        if state.device != runtime_device or mask.device != runtime_device:
+            raise ValueError(
+                "Prepared reference conditioning device mismatch: "
+                f"expected {runtime_device}, got state={state.device} mask={mask.device}."
+            )
+        if state.dtype != runtime_dtype:
+            raise ValueError(
+                "Prepared reference conditioning dtype mismatch: "
+                f"expected {runtime_dtype}, got {state.dtype}."
+            )
+        if state.shape[-1] != self.model_cfg.speaker_dim:
+            raise ValueError(
+                "Prepared reference conditioning dimension mismatch: "
+                f"expected {self.model_cfg.speaker_dim}, got {state.shape[-1]}."
+            )
+        return state, mask
+
     def synthesize(
         self,
         req: SamplingRequest,
         *,
         log_fn: Callable[[str], None] | None = None,
+        prepared_reference: PreparedReferenceConditioning | None = None,
     ) -> SamplingResult:
         def _log(msg: str) -> None:
             if log_fn is not None:
@@ -853,6 +1024,15 @@ class InferenceRuntime:
             raise ValueError(
                 f"Unsupported decode_mode={req.decode_mode!r}. Expected one of: sequential, batch."
             )
+        if prepared_reference is not None and (
+            req.ref_wav is not None
+            or req.ref_latent is not None
+            or req.ref_embed is not None
+            or req.no_ref
+        ):
+            raise ValueError(
+                "prepared_reference cannot be combined with ref_wav/ref_latent/ref_embed/no_ref."
+            )
 
         raw_text = str(req.text)
         normalized_text = normalize_text(raw_text).strip()
@@ -895,7 +1075,8 @@ class InferenceRuntime:
             None if req.speaker_kv_max_layers is None else int(req.speaker_kv_max_layers)
         )
         use_speaker_for_request = bool(
-            self.model_cfg.use_speaker_condition_resolved and not req.no_ref
+            self.model_cfg.use_speaker_condition_resolved
+            and (prepared_reference is not None or not req.no_ref)
         )
         if speaker_kv_scale is not None:
             if not use_speaker_for_request:
@@ -986,22 +1167,18 @@ class InferenceRuntime:
 
             t0 = _measure_start(self.model_device, self.codec_device)
             msg_count_before_ref = len(messages)
-            (
-                speaker_state_override,
-                speaker_mask_override,
-            ) = self._load_speaker_embedding_condition(
-                req=req,
-                batch_size=num_candidates,
-                messages=messages,
-            )
-            if speaker_state_override is None:
-                ref_latent, ref_mask = self._load_reference_latent(
+            if prepared_reference is None:
+                active_prepared_reference = self._prepare_reference_conditioning_for_request(
                     req=req,
-                    batch_size=num_candidates,
                     messages=messages,
                 )
             else:
-                ref_latent, ref_mask = None, None
+                active_prepared_reference = prepared_reference
+            speaker_state_override, speaker_mask_override = self._expand_prepared_reference(
+                active_prepared_reference,
+                batch_size=num_candidates,
+            )
+            ref_latent, ref_mask = None, None
             stage_sec = _measure_end(self.model_device, t0, self.codec_device)
             stage_timings.append(("prepare_reference", stage_sec))
             for msg in messages[msg_count_before_ref:]:
@@ -1030,8 +1207,6 @@ class InferenceRuntime:
                 )
                 if speaker_mask_override is not None:
                     has_speaker_duration = speaker_mask_override.any(dim=1)
-                elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
-                    has_speaker_duration = ref_mask.any(dim=1)
                 duration_features = build_duration_features(
                     [normalized_text] * num_candidates,
                     token_counts=text_mask.sum(dim=1),

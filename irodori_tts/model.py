@@ -1470,6 +1470,66 @@ class TextToLatentRFDiT(nn.Module):
         speaker_mask[dropout_mask] = False
         return speaker_state, speaker_mask
 
+    def encode_speaker_condition(
+        self,
+        ref_latent: torch.Tensor | None,
+        ref_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        speaker_state_override: torch.Tensor | None = None,
+        speaker_mask_override: torch.Tensor | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Encode text-independent reference conditioning once for later reuse."""
+        if not self.cfg.use_speaker_condition_resolved:
+            if speaker_state_override is not None:
+                raise ValueError(
+                    "speaker_state_override was provided but speaker conditioning is disabled."
+                )
+            return None, None
+
+        speaker_inversion = getattr(self, "speaker_inversion", None)
+        has_direct_speaker = speaker_state_override is not None or isinstance(
+            speaker_inversion, SpeakerInversionEmbedding
+        )
+        if not has_direct_speaker and (self.speaker_encoder is None or self.speaker_norm is None):
+            raise RuntimeError("Speaker conditioning is enabled but speaker modules are missing.")
+        if not has_direct_speaker and (ref_latent is None or ref_mask is None):
+            raise ValueError(
+                "ref_latent and ref_mask are required when speaker conditioning is enabled."
+            )
+
+        target_device = self.device if device is None else torch.device(device)
+        target_dtype = self.dtype if dtype is None else dtype
+        if speaker_state_override is not None:
+            speaker_state, speaker_mask = self._expand_speaker_condition_batch(
+                speaker_state_override,
+                speaker_mask_override,
+                batch_size=batch_size,
+                speaker_dim=self.cfg.speaker_dim,
+            )
+            speaker_state = speaker_state.to(device=target_device, dtype=target_dtype)
+            speaker_mask = speaker_mask.to(device=target_device, dtype=torch.bool)
+            return speaker_state, speaker_mask
+
+        if isinstance(speaker_inversion, SpeakerInversionEmbedding):
+            return speaker_inversion(
+                batch_size=batch_size,
+                device=target_device,
+                dtype=target_dtype,
+            )
+
+        ref_latent, speaker_mask = patch_sequence_with_mask(
+            seq=ref_latent,
+            mask=ref_mask,
+            patch_size=self.cfg.speaker_patch_size,
+        )
+        speaker_state = self.speaker_encoder(ref_latent, speaker_mask)
+        speaker_state = self.speaker_norm(speaker_state)
+        speaker_state, speaker_mask = self._prepend_masked_mean_token(speaker_state, speaker_mask)
+        return speaker_state, speaker_mask
+
     def encode_conditions(
         self,
         text_input_ids: torch.Tensor,
@@ -1495,25 +1555,6 @@ class TextToLatentRFDiT(nn.Module):
         if text_condition_dropout is not None:
             text_mask = text_mask.clone()
             text_mask[text_condition_dropout] = False
-        if self.cfg.use_speaker_condition_resolved:
-            speaker_inversion = getattr(self, "speaker_inversion", None)
-            has_direct_speaker = speaker_state_override is not None or isinstance(
-                speaker_inversion, SpeakerInversionEmbedding
-            )
-            if not has_direct_speaker and (
-                self.speaker_encoder is None or self.speaker_norm is None
-            ):
-                raise RuntimeError(
-                    "Speaker conditioning is enabled but speaker modules are missing."
-                )
-            if not has_direct_speaker and (ref_latent is None or ref_mask is None):
-                raise ValueError(
-                    "ref_latent and ref_mask are required when speaker conditioning is enabled."
-                )
-        elif speaker_state_override is not None:
-            raise ValueError(
-                "speaker_state_override was provided but speaker conditioning is disabled."
-            )
         if self.cfg.use_caption_condition:
             if self.caption_encoder is None or self.caption_norm is None:
                 raise RuntimeError(
@@ -1529,34 +1570,16 @@ class TextToLatentRFDiT(nn.Module):
 
         text_state = self.text_encoder(text_input_ids, text_mask)
         text_state = self.text_norm(text_state)
-        ref_state = None
+        ref_state, ref_mask = self.encode_speaker_condition(
+            ref_latent,
+            ref_mask,
+            batch_size=text_input_ids.shape[0],
+            speaker_state_override=speaker_state_override,
+            speaker_mask_override=speaker_mask_override,
+            device=text_state.device,
+            dtype=text_state.dtype,
+        )
         if self.cfg.use_speaker_condition_resolved:
-            if speaker_state_override is not None:
-                ref_state, ref_mask = self._expand_speaker_condition_batch(
-                    speaker_state_override,
-                    speaker_mask_override,
-                    batch_size=text_input_ids.shape[0],
-                    speaker_dim=self.cfg.speaker_dim,
-                )
-                ref_state = ref_state.to(device=text_state.device, dtype=text_state.dtype)
-                ref_mask = ref_mask.to(device=text_state.device, dtype=torch.bool)
-            else:
-                speaker_inversion = getattr(self, "speaker_inversion", None)
-                if isinstance(speaker_inversion, SpeakerInversionEmbedding):
-                    ref_state, ref_mask = speaker_inversion(
-                        batch_size=text_input_ids.shape[0],
-                        device=text_state.device,
-                        dtype=text_state.dtype,
-                    )
-                else:
-                    ref_latent, ref_mask = patch_sequence_with_mask(
-                        seq=ref_latent,
-                        mask=ref_mask,
-                        patch_size=self.cfg.speaker_patch_size,
-                    )
-                    ref_state = self.speaker_encoder(ref_latent, ref_mask)
-                    ref_state = self.speaker_norm(ref_state)
-                    ref_state, ref_mask = self._prepend_masked_mean_token(ref_state, ref_mask)
             ref_state, ref_mask = self._apply_speaker_condition_dropout(
                 speaker_state=ref_state,
                 speaker_mask=ref_mask,
