@@ -235,6 +235,11 @@ class PreparedReferenceConditioning:
             )
         if mask.dtype != torch.bool:
             raise ValueError(f"Prepared speaker_mask must be bool, got {mask.dtype}.")
+        if not self.speaker_conditioning_enabled and mask.any().item():
+            raise ValueError(
+                "speaker_conditioning_enabled=False requires a speaker_mask with no "
+                "active speaker tokens."
+            )
         if state.device != mask.device:
             raise ValueError(
                 "Prepared speaker_state and speaker_mask must use the same device, "

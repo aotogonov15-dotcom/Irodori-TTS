@@ -25,6 +25,17 @@ LORA_ADAPTER_STATE_NAMES = ("adapter_model.safetensors", "adapter_model.bin")
 LORA_TRAINER_STATE_NAME = "trainer_state.pt"
 LORA_METADATA_NAME = "irodori_lora_metadata.json"
 
+_SAFE_DYNAMIC_LORA_INITIALIZATIONS = {
+    "gaussian",
+    "eva",
+    "orthogonal",
+}
+_BASE_MUTATING_LORA_INITIALIZATIONS = {
+    "olora",
+    "corda",
+    "loftq",
+}
+
 LORA_TARGET_PRESETS: dict[str, str] = {
     "text_attn_mlp": (
         r"^text_encoder\.blocks\.\d+\."
@@ -244,7 +255,7 @@ def is_lora_adapter_dir(path: str | Path) -> bool:
 
 
 def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
-    """Return whether loading this adapter writes persistent shared base parameters."""
+    """Validate dynamic-runtime safety and report supported persistent bias mutation."""
     config_path = Path(path) / LORA_ADAPTER_CONFIG_NAME
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -252,6 +263,37 @@ def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
         raise ValueError(f"Invalid LoRA adapter config JSON: {config_path}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"LoRA adapter config must contain a JSON object: {config_path}")
+
+    raw_initialization = payload.get("init_lora_weights", True)
+    if isinstance(raw_initialization, bool):
+        initialization_is_safe = True
+        initialization = str(raw_initialization)
+    elif isinstance(raw_initialization, str):
+        initialization = raw_initialization.strip().lower()
+        initialization_is_safe = initialization in _SAFE_DYNAMIC_LORA_INITIALIZATIONS
+    else:
+        initialization = repr(raw_initialization)
+        initialization_is_safe = False
+
+    mutates_base = (
+        initialization == "pissa"
+        or initialization.startswith("pissa_niter_")
+        or initialization in _BASE_MUTATING_LORA_INITIALIZATIONS
+    )
+    if mutates_base:
+        raise ValueError(
+            "Unsupported LoRA adapter configuration for dynamic runtime LoRA: "
+            f"init_lora_weights={raw_initialization!r} in {config_path} can persistently "
+            "modify shared base parameters, so disabling the adapter cannot guarantee "
+            "restoration of the effective base model."
+        )
+    if not initialization_is_safe:
+        raise ValueError(
+            "Unsupported LoRA adapter configuration for dynamic runtime LoRA: "
+            f"init_lora_weights={raw_initialization!r} in {config_path} is not a "
+            "recognized non-mutating initialization, so safe base restoration cannot "
+            "be proven."
+        )
 
     bias = str(payload.get("bias", "none")).strip().lower()
     if bias not in {"none", "all", "lora_only"}:
