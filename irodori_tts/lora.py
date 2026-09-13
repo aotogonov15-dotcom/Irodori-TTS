@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -240,6 +241,25 @@ def is_lora_adapter_dir(path: str | Path) -> bool:
     if not (candidate / LORA_ADAPTER_CONFIG_NAME).is_file():
         return False
     return any((candidate / name).is_file() for name in LORA_ADAPTER_STATE_NAMES)
+
+
+def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
+    """Return whether loading this adapter writes persistent shared base parameters."""
+    config_path = Path(path) / LORA_ADAPTER_CONFIG_NAME
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid LoRA adapter config JSON: {config_path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"LoRA adapter config must contain a JSON object: {config_path}")
+
+    bias = str(payload.get("bias", "none")).strip().lower()
+    if bias not in {"none", "all", "lora_only"}:
+        raise ValueError(
+            f"Unsupported LoRA adapter bias={bias!r} in {config_path}. "
+            "Expected one of: none, all, lora_only."
+        )
+    return bias != "none"
 
 
 def load_lora_adapter(

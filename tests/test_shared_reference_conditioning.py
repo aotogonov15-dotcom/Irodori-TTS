@@ -59,6 +59,7 @@ class _FakeModel(torch.nn.Module):
         self.speaker_encode_count = 0
         self.condition_speaker_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.forward_speaker_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.duration_has_speaker: list[torch.Tensor] = []
 
     @property
     def device(self) -> torch.device:
@@ -78,14 +79,21 @@ class _FakeModel(torch.nn.Module):
         speaker_mask_override: torch.Tensor | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        del ref_mask, speaker_mask_override
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        del speaker_mask_override
         if speaker_state_override is not None:
             raise AssertionError("prepared inputs must not be re-encoded")
+        if not self.cfg.use_speaker_condition_resolved:
+            return None, None
         self.speaker_encode_count += 1
-        assert ref_latent is not None
+        assert ref_latent is not None and ref_mask is not None
         state = torch.arange(12, dtype=dtype, device=device).reshape(1, 4, 3)
-        mask = torch.ones((1, 4), dtype=torch.bool, device=device)
+        mask = torch.full(
+            (1, 4),
+            bool(ref_mask.any().item()),
+            dtype=torch.bool,
+            device=device,
+        )
         self.assert_batch_size = batch_size
         return state, mask
 
@@ -101,6 +109,7 @@ class _FakeModel(torch.nn.Module):
         return text_state, text_mask, state, mask, None, None
 
     def predict_duration_log_frames(self, **kwargs) -> torch.Tensor:
+        self.duration_has_speaker.append(kwargs["has_speaker"].detach().clone())
         batch_size = kwargs["text_state"].shape[0]
         return torch.full((batch_size,), math.log1p(4.0), dtype=torch.float32)
 
@@ -222,6 +231,8 @@ def _make_runtime() -> InferenceRuntime:
     runtime._infer_lock = threading.Lock()
     runtime._model_dtype = torch.float32
     runtime._lora_adapter_names = {}
+    runtime._effective_conditioning_state_revision = 0
+    runtime._lora_load_failure = None
     return runtime
 
 
@@ -253,6 +264,8 @@ def _make_real_runtime(
     runtime._infer_lock = threading.Lock()
     runtime._model_dtype = torch.float32
     runtime._lora_adapter_names = {}
+    runtime._effective_conditioning_state_revision = 0
+    runtime._lora_load_failure = None
     return runtime
 
 
@@ -361,7 +374,7 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
             ),
             (
                 torch.zeros((1, 1, 2)),
-                torch.ones((1, 1), dtype=torch.bool),
+                torch.zeros((1, 1), dtype=torch.bool),
             ),
         )
 
@@ -501,6 +514,97 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
         torch.testing.assert_close(prepared.speaker_state, original_state, rtol=0, atol=0)
         torch.testing.assert_close(prepared.speaker_mask, original_mask)
 
+    def test_real_no_ref_duration_and_sampling_match_prepared_strictly(self) -> None:
+        torch.manual_seed(67)
+        model = TextToLatentRFDiT(
+            _small_model_config(use_duration_predictor=True)
+        ).eval()
+        torch.nn.init.normal_(model.out_proj.weight, std=0.02)
+        no_ref_latent = torch.zeros((1, 1, 2))
+        no_ref_mask = torch.zeros((1, 1), dtype=torch.bool)
+        text_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        text_mask = torch.ones_like(text_ids, dtype=torch.bool)
+
+        with torch.inference_mode():
+            prepared_state, prepared_mask = model.encode_speaker_condition(
+                no_ref_latent,
+                no_ref_mask,
+                batch_size=1,
+            )
+            ordinary_conditions = model.encode_conditions(
+                text_ids,
+                text_mask,
+                no_ref_latent,
+                no_ref_mask,
+            )
+            prepared_conditions = model.encode_conditions(
+                text_ids,
+                text_mask,
+                None,
+                None,
+                speaker_state_override=prepared_state,
+                speaker_mask_override=prepared_mask,
+            )
+            duration_kwargs = {
+                "duration_features": torch.zeros((1, model.cfg.duration_aux_dim)),
+                "has_speaker": torch.zeros((1,), dtype=torch.bool),
+            }
+            ordinary_duration = model.predict_duration_log_frames(
+                text_state=ordinary_conditions[0],
+                text_mask=ordinary_conditions[1],
+                speaker_state=ordinary_conditions[2],
+                speaker_mask=ordinary_conditions[3],
+                **duration_kwargs,
+            )
+            prepared_duration = model.predict_duration_log_frames(
+                text_state=prepared_conditions[0],
+                text_mask=prepared_conditions[1],
+                speaker_state=prepared_conditions[2],
+                speaker_mask=prepared_conditions[3],
+                **duration_kwargs,
+            )
+            ordinary_sample = sample_euler_rf_cfg(
+                model=model,
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=no_ref_latent,
+                ref_mask=no_ref_mask,
+                sequence_length=2,
+                num_steps=2,
+                cfg_scale_text=3.0,
+                cfg_scale_speaker=0.0,
+                seed=71,
+                use_context_kv_cache=True,
+            )
+            prepared_sample = sample_euler_rf_cfg(
+                model=model,
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=None,
+                ref_mask=None,
+                sequence_length=2,
+                speaker_state_override=prepared_state,
+                speaker_mask_override=prepared_mask,
+                num_steps=2,
+                cfg_scale_text=3.0,
+                cfg_scale_speaker=0.0,
+                seed=71,
+                use_context_kv_cache=True,
+            )
+
+        self.assertFalse(prepared_mask.any().item())
+        for prepared_tensor, ordinary_tensor in zip(
+            prepared_conditions,
+            ordinary_conditions,
+            strict=True,
+        ):
+            if prepared_tensor is not None:
+                torch.testing.assert_close(
+                    prepared_tensor, ordinary_tensor, rtol=0, atol=0
+                )
+        torch.testing.assert_close(prepared_duration, ordinary_duration, rtol=0, atol=0)
+        torch.testing.assert_close(prepared_sample, ordinary_sample, rtol=0, atol=0)
+
     def test_cfg_expansion_does_not_mutate_prepared_batch_views(self) -> None:
         model = _FakeModel()
         state = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
@@ -602,6 +706,134 @@ class InferenceRuntimeSharedConditioningTest(unittest.TestCase):
         torch.testing.assert_close(prepared.speaker_mask, original_mask)
         self.assertEqual(result.used_seed, 4321)
 
+    def test_prepared_no_ref_matches_ordinary_no_ref_across_cfg_duration_and_kv(self) -> None:
+        cases = (
+            ("cfg_off_manual_kv_off", "independent", 1.0, 0.5, False, None),
+            ("cfg_joint_auto_kv_scaled", "joint", None, None, True, 2.0),
+            ("cfg_independent_auto_kv_scaled", "independent", None, None, True, 2.0),
+        )
+        for name, cfg_mode, cfg_scale, seconds, context_kv_cache, speaker_kv_scale in cases:
+            with self.subTest(name=name):
+                ordinary_runtime = _make_runtime()
+                prepared_runtime = _make_runtime()
+                prepared = prepared_runtime.prepare_reference_conditioning(no_ref=True)
+                self.assertFalse(prepared.speaker_conditioning_enabled)
+                self.assertFalse(prepared.speaker_mask.any().item())
+
+                common = {
+                    "text": "prepared no reference",
+                    "seconds": seconds,
+                    "min_seconds": 0.5,
+                    "max_seconds": 2.0,
+                    "num_steps": 1,
+                    "seed": 53,
+                    "trim_tail": False,
+                    "cfg_guidance_mode": cfg_mode,
+                    "cfg_scale": cfg_scale,
+                    "context_kv_cache": context_kv_cache,
+                    "speaker_kv_scale": speaker_kv_scale,
+                }
+                ordinary_request = SamplingRequest(no_ref=True, **common)
+                prepared_request = SamplingRequest(**common)
+                sampler_calls: list[dict] = []
+
+                def capture_sampler(*, _calls=sampler_calls, **kwargs):
+                    _calls.append(kwargs)
+                    return _zero_sampler(**kwargs)
+
+                with patch(
+                    "irodori_tts.inference_runtime.sample_euler_rf_cfg",
+                    side_effect=capture_sampler,
+                ):
+                    ordinary_result = ordinary_runtime.synthesize(ordinary_request)
+                    prepared_result = prepared_runtime.synthesize(
+                        prepared_request,
+                        prepared_reference=prepared,
+                    )
+
+                torch.testing.assert_close(
+                    prepared_result.audio, ordinary_result.audio, rtol=0, atol=0
+                )
+                self.assertEqual(prepared_result.used_seed, ordinary_result.used_seed)
+                self.assertEqual(len(sampler_calls), 2)
+                ordinary_call, prepared_call = sampler_calls
+                for key in (
+                    "cfg_scale_text",
+                    "cfg_scale_caption",
+                    "cfg_scale_speaker",
+                    "use_context_kv_cache",
+                    "speaker_kv_scale",
+                    "speaker_kv_min_t",
+                ):
+                    self.assertEqual(prepared_call[key], ordinary_call[key])
+                torch.testing.assert_close(
+                    prepared_call["speaker_state_override"],
+                    ordinary_call["speaker_state_override"],
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    prepared_call["speaker_mask_override"],
+                    ordinary_call["speaker_mask_override"],
+                    rtol=0,
+                    atol=0,
+                )
+                self.assertFalse(prepared_call["speaker_mask_override"].any().item())
+                if speaker_kv_scale is not None:
+                    self.assertIsNone(prepared_call["speaker_kv_scale"])
+                    self.assertTrue(
+                        any("ignoring speaker_kv_scale" in msg for msg in prepared_result.messages)
+                    )
+                if seconds is None:
+                    self.assertFalse(
+                        ordinary_runtime.model.duration_has_speaker[-1].any().item()
+                    )
+                    self.assertFalse(
+                        prepared_runtime.model.duration_has_speaker[-1].any().item()
+                    )
+                else:
+                    self.assertEqual(ordinary_runtime.model.duration_has_speaker, [])
+                    self.assertEqual(prepared_runtime.model.duration_has_speaker, [])
+
+    def test_prepared_no_ref_matches_when_checkpoint_disables_speaker_conditioning(self) -> None:
+        ordinary_runtime = _make_runtime()
+        prepared_runtime = _make_runtime()
+        for runtime in (ordinary_runtime, prepared_runtime):
+            runtime.model_cfg.use_speaker_condition_resolved = False
+            runtime.model.cfg.use_speaker_condition_resolved = False
+
+        prepared = prepared_runtime.prepare_reference_conditioning(no_ref=True)
+        self.assertFalse(prepared.speaker_conditioning_enabled)
+        self.assertIsNone(prepared.speaker_state)
+        request_kwargs = {
+            "text": "speaker disabled",
+            "seconds": 0.5,
+            "min_seconds": 0.5,
+            "max_seconds": 0.5,
+            "num_steps": 1,
+            "seed": 59,
+            "trim_tail": False,
+            "cfg_guidance_mode": "joint",
+            "speaker_kv_scale": 2.0,
+        }
+        with patch("irodori_tts.inference_runtime.sample_euler_rf_cfg", _zero_sampler):
+            ordinary = ordinary_runtime.synthesize(
+                SamplingRequest(no_ref=True, **request_kwargs)
+            )
+            reused = prepared_runtime.synthesize(
+                SamplingRequest(**request_kwargs), prepared_reference=prepared
+            )
+        torch.testing.assert_close(reused.audio, ordinary.audio, rtol=0, atol=0)
+
+    def test_prepared_no_ref_is_the_complete_source_semantic(self) -> None:
+        runtime = _make_runtime()
+        prepared = runtime.prepare_reference_conditioning(no_ref=True)
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            runtime.synthesize(
+                SamplingRequest(text="ambiguous", no_ref=True),
+                prepared_reference=prepared,
+            )
+
 
 class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
     @classmethod
@@ -616,8 +848,29 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.adapter_a = Path(cls.temp_dir.name) / "adapter-a"
         cls.adapter_b = Path(cls.temp_dir.name) / "adapter-b"
+        cls.adapter_bias_all = Path(cls.temp_dir.name) / "adapter-bias-all"
+        cls.adapter_bias_lora_only = Path(cls.temp_dir.name) / "adapter-bias-lora-only"
+        cls.adapter_modules_to_save = Path(cls.temp_dir.name) / "adapter-modules-to-save"
         cls._save_adapter(cls.adapter_a, scale=0.10)
         cls._save_adapter(cls.adapter_b, scale=-0.15)
+        cls._save_adapter(
+            cls.adapter_bias_all,
+            scale=0.20,
+            bias="all",
+            bias_shift=0.75,
+        )
+        cls._save_adapter(
+            cls.adapter_bias_lora_only,
+            scale=-0.20,
+            bias="lora_only",
+            bias_shift=-0.50,
+        )
+        cls._save_adapter(
+            cls.adapter_modules_to_save,
+            scale=0.12,
+            modules_to_save="speaker_norm",
+            modules_to_save_shift=0.40,
+        )
         cls.ref_latent = torch.randn((1, 6, 2))
         cls.ref_mask = torch.tensor([[True, True, True, True, True, False]])
 
@@ -626,7 +879,16 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     @classmethod
-    def _save_adapter(cls, path: Path, *, scale: float) -> None:
+    def _save_adapter(
+        cls,
+        path: Path,
+        *,
+        scale: float,
+        bias: str = "none",
+        bias_shift: float = 0.0,
+        modules_to_save: str = "none",
+        modules_to_save_shift: float = 0.0,
+    ) -> None:
         model = TextToLatentRFDiT(cls.cfg).eval()
         model.load_state_dict(cls.base_state)
         peft_model = apply_lora(
@@ -636,12 +898,14 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
                 "lora_r": 2,
                 "lora_alpha": 2,
                 "lora_dropout": 0.0,
-                "lora_bias": "none",
+                "lora_bias": bias,
                 "lora_target_modules": r"^speaker_encoder\.in_proj$",
-                "lora_modules_to_save": "none",
+                "lora_modules_to_save": modules_to_save,
             },
         )
         touched = 0
+        touched_bias = 0
+        touched_modules_to_save = 0
         with torch.no_grad():
             for name, parameter in peft_model.named_parameters():
                 if "lora_A" in name:
@@ -650,8 +914,25 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
                 elif "lora_B" in name:
                     parameter.fill_(scale)
                     touched += 1
+                elif bias_shift and "bias" in name and parameter.requires_grad:
+                    parameter.add_(
+                        torch.arange(
+                            parameter.numel(),
+                            dtype=parameter.dtype,
+                            device=parameter.device,
+                        ).reshape_as(parameter)
+                        * bias_shift
+                    )
+                    touched_bias += 1
+                elif modules_to_save_shift and ".modules_to_save." in name:
+                    parameter.add_(modules_to_save_shift)
+                    touched_modules_to_save += 1
         if touched == 0:
             raise AssertionError("test adapter did not target the speaker encoder")
+        if bias_shift and touched_bias == 0:
+            raise AssertionError("test adapter did not expose trainable bias parameters")
+        if modules_to_save_shift and touched_modules_to_save == 0:
+            raise AssertionError("test adapter did not wrap modules_to_save")
         peft_model.save_pretrained(path)
 
     def _runtime(self) -> InferenceRuntime:
@@ -738,6 +1019,45 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         torch.testing.assert_close(prepared_base.speaker_state, expected_base, rtol=0, atol=0)
         self.assertIsNone(prepared_base._lora_adapter)
 
+    def test_bias_adapters_advance_effective_state_and_reject_stale_base(self) -> None:
+        for adapter in (self.adapter_bias_all, self.adapter_bias_lora_only):
+            with self.subTest(adapter=adapter.name):
+                runtime = self._runtime()
+                base_before = self._prepare(runtime, None)
+                adapter_prepared = self._prepare(runtime, adapter)
+                base_after = self._prepare(runtime, None)
+
+                self.assertEqual(base_before._effective_conditioning_state_revision, 0)
+                self.assertEqual(adapter_prepared._effective_conditioning_state_revision, 1)
+                self.assertEqual(base_after._effective_conditioning_state_revision, 1)
+                if adapter == self.adapter_bias_all:
+                    self.assertGreater(
+                        (base_before.speaker_state - base_after.speaker_state)
+                        .abs()
+                        .max()
+                        .item(),
+                        1e-6,
+                    )
+                with self.assertRaisesRegex(ValueError, "model-state mismatch"):
+                    self._synthesize_prepared(runtime, base_before, None)
+                self._synthesize_prepared(runtime, base_after, None)
+
+    def test_modules_to_save_restores_base_without_advancing_effective_state(self) -> None:
+        runtime = self._runtime()
+        base_before = self._prepare(runtime, None)
+        adapter_prepared = self._prepare(runtime, self.adapter_modules_to_save)
+        base_after = self._prepare(runtime, None)
+
+        self.assertEqual(runtime._effective_conditioning_state_revision, 0)
+        self.assertGreater(
+            (adapter_prepared.speaker_state - base_before.speaker_state).abs().max().item(),
+            1e-6,
+        )
+        torch.testing.assert_close(
+            base_after.speaker_state, base_before.speaker_state, rtol=0, atol=0
+        )
+        self._synthesize_prepared(runtime, base_before, None)
+
     def test_base_prepare_failure_restores_prior_adapter_and_next_request_is_consistent(self) -> None:
         runtime = self._runtime()
         prepared_a = self._prepare(runtime, self.adapter_a)
@@ -780,6 +1100,86 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         prepared_base = self._prepare(runtime, None)
         torch.testing.assert_close(prepared_base.speaker_state, expected_base, rtol=0, atol=0)
         self._synthesize_prepared(runtime, prepared_base, None)
+
+    def test_bias_conditioning_failure_invalidates_pre_mutation_base(self) -> None:
+        runtime = self._runtime()
+        prepared_base = self._prepare(runtime, None)
+
+        with (
+            patch.object(
+                runtime,
+                "_prepare_reference_conditioning_for_request",
+                side_effect=RuntimeError("expected bias conditioning failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected bias conditioning failure"),
+        ):
+            runtime.prepare_reference_conditioning(lora_adapter=str(self.adapter_bias_all))
+
+        self.assertEqual(runtime._effective_conditioning_state_revision, 1)
+        with self.assertRaisesRegex(ValueError, "model-state mismatch"):
+            self._synthesize_prepared(runtime, prepared_base, None)
+        prepared_base_after = self._prepare(runtime, None)
+        self._synthesize_prepared(runtime, prepared_base_after, None)
+
+    def test_adapter_load_failure_marks_runtime_unavailable_until_reload(self) -> None:
+        runtime = self._runtime()
+        prepared_base = self._prepare(runtime, None)
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=RuntimeError("expected adapter load failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "may have partially changed"),
+        ):
+            self._prepare(runtime, self.adapter_a)
+
+        with self.assertRaisesRegex(RuntimeError, "unavailable after a failed dynamic LoRA load"):
+            self._synthesize_prepared(runtime, prepared_base, None)
+
+        replacement_runtime = self._runtime()
+        replacement_prepared = self._prepare(replacement_runtime, None)
+        self._synthesize_prepared(replacement_runtime, replacement_prepared, None)
+
+    def test_adapter_resolve_failure_leaves_effective_state_unchanged(self) -> None:
+        runtime = self._runtime()
+        prepared_base = self._prepare(runtime, None)
+        missing = Path(self.temp_dir.name) / "missing-adapter"
+
+        with self.assertRaises(FileNotFoundError):
+            runtime.prepare_reference_conditioning(lora_adapter=str(missing))
+
+        self.assertEqual(runtime._effective_conditioning_state_revision, 0)
+        self.assertIsNone(runtime._lora_load_failure)
+        self._synthesize_prepared(runtime, prepared_base, None)
+
+    def test_synthesis_failure_after_bias_load_invalidates_old_base(self) -> None:
+        runtime = self._runtime()
+        prepared_base = self._prepare(runtime, None)
+        request = SamplingRequest(
+            text="bias synthesis failure",
+            no_ref=True,
+            seconds=0.5,
+            min_seconds=0.5,
+            max_seconds=0.5,
+            num_steps=1,
+            seed=61,
+            trim_tail=False,
+            lora_adapter=str(self.adapter_bias_all),
+        )
+        with (
+            patch(
+                "irodori_tts.inference_runtime.sample_euler_rf_cfg",
+                side_effect=RuntimeError("expected synthesis failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected synthesis failure"),
+        ):
+            runtime.synthesize(request)
+
+        with self.assertRaisesRegex(ValueError, "model-state mismatch"):
+            self._synthesize_prepared(runtime, prepared_base, None)
+        prepared_base_after = self._prepare(runtime, None)
+        self._synthesize_prepared(runtime, prepared_base_after, None)
 
     def test_base_lora_base_lora_base_sequence_is_explicit(self) -> None:
         runtime = self._runtime()
@@ -837,6 +1237,35 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         self.assertEqual(runtime.codec.encode_count, 1)
         self.assertEqual(result.used_seed, 41)
         self.assertEqual(result.audio.shape, (1, 4))
+
+    def test_ordinary_wav_bias_lora_is_consistent_and_invalidates_old_base(self) -> None:
+        runtime = self._runtime()
+        prepared_base = self._prepare(runtime, None)
+        request = SamplingRequest(
+            text="ordinary wav bias lora",
+            ref_wav="reference.wav",
+            ref_normalize_db=None,
+            seconds=None,
+            min_seconds=0.5,
+            max_seconds=1.0,
+            num_steps=1,
+            seed=73,
+            trim_tail=False,
+            lora_adapter=str(self.adapter_bias_all),
+        )
+
+        with patch(
+            "irodori_tts.inference_runtime._load_audio",
+            return_value=(torch.zeros((1, 8)), 4),
+        ):
+            result = runtime.synthesize(request)
+
+        self.assertEqual(runtime.codec.encode_count, 1)
+        self.assertEqual(runtime._effective_conditioning_state_revision, 1)
+        self.assertEqual(result.used_seed, 73)
+        self.assertEqual(result.audio.shape, (1, 4))
+        with self.assertRaisesRegex(ValueError, "model-state mismatch"):
+            self._synthesize_prepared(runtime, prepared_base, None)
 
 
 if __name__ == "__main__":

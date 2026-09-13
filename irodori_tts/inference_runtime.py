@@ -21,7 +21,12 @@ from safetensors.torch import load_file as load_safetensors_file
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .duration import build_duration_features
-from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_adapter
+from .lora import (
+    checkpoint_state_uses_lora,
+    is_lora_adapter_dir,
+    load_lora_adapter,
+    lora_adapter_mutates_base_parameters,
+)
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
 from .speaker_inversion import (
@@ -197,8 +202,14 @@ class PreparedReferenceConditioning:
     speaker_state: torch.Tensor | None
     speaker_mask: torch.Tensor | None
     _lora_adapter: str | None
+    speaker_conditioning_enabled: bool = True
+    _effective_conditioning_state_revision: int = 0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.speaker_conditioning_enabled, bool):
+            raise ValueError("speaker_conditioning_enabled must be bool.")
+        if self._effective_conditioning_state_revision < 0:
+            raise ValueError("effective conditioning state revision must be non-negative.")
         state = self.speaker_state
         mask = self.speaker_mask
         if (state is None) != (mask is None):
@@ -553,6 +564,8 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        self._effective_conditioning_state_revision = 0
+        self._lora_load_failure: str | None = None
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -692,6 +705,12 @@ class InferenceRuntime:
         messages: list[str],
         log_fn: Callable[[str], None],
     ) -> Any:
+        if self._lora_load_failure is not None:
+            raise RuntimeError(
+                "This inference runtime is unavailable after a failed dynamic LoRA load; "
+                "reload the runtime before another request. "
+                f"Original failure: {self._lora_load_failure}"
+            )
         if resolved_adapter_path is None:
             disable_adapter = getattr(self.model, "disable_adapter", None)
             if callable(disable_adapter):
@@ -715,20 +734,32 @@ class InferenceRuntime:
             messages.append(msg)
             log_fn(msg)
 
-        self.model = load_lora_adapter(
-            self.model,
-            resolved_adapter_path,
-            is_trainable=False,
-            adapter_name=adapter_name,
-            torch_device=str(self.model_device),
-        )
+        if resolved_adapter_path not in self._lora_adapter_names:
+            if lora_adapter_mutates_base_parameters(resolved_adapter_path):
+                # PEFT loads bias="all"/"lora_only" tensors into shared base parameters.
+                # Advance before loading so even a partial failed mutation invalidates old state.
+                self._effective_conditioning_state_revision += 1
+        try:
+            self.model = load_lora_adapter(
+                self.model,
+                resolved_adapter_path,
+                is_trainable=False,
+                adapter_name=adapter_name,
+                torch_device=str(self.model_device),
+            )
+            self.model = _move_inference_module(
+                self.model,
+                device=self.model_device,
+                dtype=self._model_dtype,
+            )
+            self.model.eval()
+        except Exception as exc:
+            self._lora_load_failure = f"{type(exc).__name__}: {exc}"
+            raise RuntimeError(
+                "Dynamic LoRA adapter loading failed and may have partially changed the model; "
+                "reload the inference runtime before another request."
+            ) from exc
         self._lora_adapter_names[resolved_adapter_path] = adapter_name
-        self.model = _move_inference_module(
-            self.model,
-            device=self.model_device,
-            dtype=self._model_dtype,
-        )
-        self.model.eval()
         return nullcontext()
 
     def _load_reference_latent(
@@ -902,6 +933,12 @@ class InferenceRuntime:
             speaker_state=speaker_state,
             speaker_mask=speaker_mask,
             _lora_adapter=effective_lora_adapter,
+            speaker_conditioning_enabled=bool(
+                self.model_cfg.use_speaker_condition_resolved and not req.no_ref
+            ),
+            _effective_conditioning_state_revision=(
+                self._effective_conditioning_state_revision
+            ),
         )
 
     def prepare_reference_conditioning(
@@ -972,6 +1009,21 @@ class InferenceRuntime:
             "Prepared reference conditioning LoRA mismatch: "
             f"prepared with {prepared_label!r}, but synthesis requested {requested_label!r}. "
             "Prepare the reference again with the same lora_adapter."
+        )
+
+    def _validate_prepared_effective_conditioning_state(
+        self,
+        prepared: PreparedReferenceConditioning,
+    ) -> None:
+        if (
+            prepared._effective_conditioning_state_revision
+            == self._effective_conditioning_state_revision
+        ):
+            return
+        raise ValueError(
+            "Prepared reference conditioning model-state mismatch: the effective "
+            "speaker-conditioning state changed after this reference was prepared. "
+            "Prepare the reference again for the current runtime state."
         )
 
     def _expand_prepared_reference(
@@ -1122,7 +1174,11 @@ class InferenceRuntime:
         )
         use_speaker_for_request = bool(
             self.model_cfg.use_speaker_condition_resolved
-            and (prepared_reference is not None or not req.no_ref)
+            and (
+                prepared_reference.speaker_conditioning_enabled
+                if prepared_reference is not None
+                else not req.no_ref
+            )
         )
         if speaker_kv_scale is not None:
             if not use_speaker_for_request:
@@ -1184,6 +1240,8 @@ class InferenceRuntime:
             ),
             torch.inference_mode(),
         ):
+            if prepared_reference is not None:
+                self._validate_prepared_effective_conditioning_state(prepared_reference)
             t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
                 [normalized_text] * num_candidates,
