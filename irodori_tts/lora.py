@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,17 @@ _BASE_MUTATING_LORA_INITIALIZATIONS = {
     "corda",
     "loftq",
 }
+
+
+@dataclass(frozen=True)
+class LoraAdapterPreflight:
+    """Dynamic-loading facts validated before PEFT can mutate the model."""
+
+    bias: str
+
+    @property
+    def mutates_base_parameters(self) -> bool:
+        return self.bias != "none"
 
 LORA_TARGET_PRESETS: dict[str, str] = {
     "text_attn_mlp": (
@@ -259,8 +271,7 @@ def is_lora_adapter_dir(path: str | Path) -> bool:
     return any((candidate / name).is_file() for name in LORA_ADAPTER_STATE_NAMES)
 
 
-def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
-    """Validate dynamic-runtime safety and report supported persistent bias mutation."""
+def _validated_lora_adapter_config(path: str | Path) -> tuple[Path, dict[str, Any], str]:
     config_path = Path(path) / LORA_ADAPTER_CONFIG_NAME
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -301,7 +312,209 @@ def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
             f"Unsupported LoRA adapter bias={bias!r} in {config_path}. "
             "Expected an exact canonical value from: none, all, lora_only."
         )
+    return config_path, payload, bias
+
+
+def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
+    """Validate config-only safety and report supported persistent bias mutation."""
+    _, _, bias = _validated_lora_adapter_config(path)
     return bias != "none"
+
+
+def _unwrapped_model(model: torch.nn.Module) -> torch.nn.Module:
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        return get_base_model()
+    return model
+
+
+def _canonical_base_parameter_name(name: str) -> str:
+    for prefix in ("base_model.model.", "base_model."):
+        if name.startswith(prefix):
+            name = name.removeprefix(prefix)
+            break
+    while ".base_layer." in name:
+        name = name.replace(".base_layer.", ".")
+    while ".original_module." in name:
+        name = name.replace(".original_module.", ".")
+    return name
+
+
+def _peft_target_module_names(model: torch.nn.Module, peft_config: Any) -> set[str]:
+    # These are the same matching helpers and existing-adapter exclusion used by PEFT 0.18.1
+    # while injecting a LoRA adapter. Keeping this dry-run tied to PEFT avoids subtly different
+    # rank_pattern behavior.
+    from peft.tuners.tuners_utils import (
+        BaseTunerLayer,
+        _ExcludedModule,
+        _maybe_include_all_linear_layers,
+        check_target_module_exists,
+    )
+
+    base_model = _unwrapped_model(model)
+    peft_config = _maybe_include_all_linear_layers(peft_config, base_model)
+    named_modules = list(base_model.named_modules())
+    existing_adapter_prefixes = [
+        f"{name}." for name, module in named_modules if isinstance(module, BaseTunerLayer)
+    ]
+    targets: set[str] = set()
+    for name, _ in named_modules:
+        if not name or any(name.startswith(prefix) for prefix in existing_adapter_prefixes):
+            continue
+        match = check_target_module_exists(peft_config, name)
+        if match and not isinstance(match, _ExcludedModule):
+            targets.add(name)
+
+    target_parameters = getattr(peft_config, "target_parameters", None) or []
+    if target_parameters:
+        parameter_names = {
+            _canonical_base_parameter_name(name)
+            for name, _ in base_model.named_parameters()
+            if ".lora_" not in name and ".modules_to_save." not in name
+        }
+        for name in parameter_names:
+            if name in target_parameters or any(
+                name.endswith(f".{target}") for target in target_parameters
+            ):
+                targets.add(name)
+    return targets
+
+
+def _validate_orthogonal_ranks(
+    model: torch.nn.Module,
+    peft_config: Any,
+    *,
+    config_path: Path,
+) -> set[str]:
+    from peft.utils.other import get_pattern_key
+
+    target_names = _peft_target_module_names(model, peft_config)
+    rank_pattern = peft_config.rank_pattern
+    for target_name in sorted(target_names):
+        rank_key = get_pattern_key(rank_pattern.keys(), target_name)
+        rank = rank_pattern.get(rank_key, peft_config.r)
+        if rank % 2:
+            raise ValueError(
+                "Unsupported LoRA adapter configuration for dynamic runtime LoRA: "
+                f"orthogonal initialization requires an even effective rank, but {target_name!r} "
+                f"receives r={rank} in {config_path}."
+            )
+    return target_names
+
+
+def _modules_to_save_names(model: torch.nn.Module, peft_config: Any) -> set[str]:
+    configured = peft_config.modules_to_save or []
+    if not configured:
+        return set()
+    return {
+        name
+        for name, _ in _unwrapped_model(model).named_modules()
+        if any(name.endswith(target) for target in configured)
+    }
+
+
+def _shared_base_bias_names(model: torch.nn.Module) -> set[str]:
+    return {
+        _canonical_base_parameter_name(name)
+        for name, _ in _unwrapped_model(model).named_parameters()
+        if name.endswith(".bias")
+        and ".lora_" not in name
+        and ".modules_to_save." not in name
+    }
+
+
+def _validate_lora_adapter_state(
+    model: torch.nn.Module,
+    path: str | Path,
+    *,
+    bias: str,
+    target_names: set[str],
+    peft_config: Any,
+) -> None:
+    # This is PEFT's own local-file selection and deserialization path (safetensors first,
+    # then adapter_model.bin with weights_only=True), so the keys checked here are precisely
+    # the payload that set_peft_model_state_dict will receive.
+    from peft.utils.save_and_load import load_peft_weights
+
+    state = load_peft_weights(str(path), device="cpu")
+    if not isinstance(state, Mapping):
+        raise ValueError(f"LoRA adapter state must contain a tensor mapping: {path}")
+
+    modules_to_save = _modules_to_save_names(model, peft_config)
+    shared_biases = _shared_base_bias_names(model)
+    unsafe_keys: list[str] = []
+    for key in state:
+        if not isinstance(key, str):
+            unsafe_keys.append(repr(key))
+            continue
+
+        # PEFT inserts the runtime adapter name into every LoRA-prefixed state key.
+        if "lora_" in key:
+            continue
+
+        canonical_key = _canonical_base_parameter_name(key)
+        if any(
+            canonical_key == module_name or canonical_key.startswith(f"{module_name}.")
+            for module_name in modules_to_save
+        ):
+            # PEFT remaps these keys into ModulesToSaveWrapper.modules_to_save[adapter].
+            continue
+
+        if canonical_key.endswith(".bias") and canonical_key in shared_biases:
+            if bias == "all":
+                continue
+            if bias == "lora_only" and canonical_key.removesuffix(".bias") in target_names:
+                continue
+
+        # Every remaining key is passed through unchanged to model.load_state_dict(strict=False).
+        # If it matches, it writes shared state; if it does not, rejecting it is the fail-closed
+        # behavior required for an unrecognized dynamic adapter payload.
+        unsafe_keys.append(key)
+
+    if unsafe_keys:
+        sample = ", ".join(repr(key) for key in unsafe_keys[:3])
+        if len(unsafe_keys) > 3:
+            sample += f", ... ({len(unsafe_keys)} total)"
+        raise ValueError(
+            "Unsupported LoRA adapter state for dynamic runtime LoRA: payload contains "
+            f"unrecognized shared-base writes in {path}: {sample}."
+        )
+
+
+def preflight_lora_adapter(
+    model: torch.nn.Module,
+    path: str | Path,
+) -> LoraAdapterPreflight:
+    """Validate config, load payload, ranks, and loaded-adapter conflicts without mutation."""
+    config_path, payload, bias = _validated_lora_adapter_config(path)
+    lora_config_cls, _, _ = _require_peft()
+    peft_config = lora_config_cls.from_pretrained(str(path))
+
+    target_names = _peft_target_module_names(model, peft_config)
+    if payload.get("init_lora_weights", True) == "orthogonal":
+        target_names = _validate_orthogonal_ranks(
+            model,
+            peft_config,
+            config_path=config_path,
+        )
+
+    loaded_configs = getattr(model, "peft_config", {})
+    if bias != "none" and any(
+        getattr(config, "bias", "none") != "none" for config in loaded_configs.values()
+    ):
+        raise ValueError(
+            "Unsupported LoRA adapter combination for dynamic runtime LoRA: PEFT supports "
+            "only one loaded adapter with bias != 'none'."
+        )
+
+    _validate_lora_adapter_state(
+        model,
+        path,
+        bias=bias,
+        target_names=target_names,
+        peft_config=peft_config,
+    )
+    return LoraAdapterPreflight(bias=bias)
 
 
 def load_lora_adapter(

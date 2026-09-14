@@ -25,7 +25,7 @@ from .lora import (
     checkpoint_state_uses_lora,
     is_lora_adapter_dir,
     load_lora_adapter,
-    lora_adapter_mutates_base_parameters,
+    preflight_lora_adapter,
 )
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
@@ -740,7 +740,8 @@ class InferenceRuntime:
             log_fn(msg)
 
         if resolved_adapter_path not in self._lora_adapter_names:
-            if lora_adapter_mutates_base_parameters(resolved_adapter_path):
+            preflight = preflight_lora_adapter(self.model, resolved_adapter_path)
+            if preflight.mutates_base_parameters:
                 # PEFT loads bias="all"/"lora_only" tensors into shared base parameters.
                 # Advance before loading so even a partial failed mutation invalidates old state.
                 self._effective_conditioning_state_revision += 1
