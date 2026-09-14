@@ -320,6 +320,14 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
         self.assertFalse(prepared.speaker_mask.any().item())
 
     def test_enabled_speaker_conditioning_requires_an_active_mask(self) -> None:
+        with self.assertRaisesRegex(ValueError, "speaker_state and speaker_mask to be set"):
+            PreparedReferenceConditioning(
+                None,
+                None,
+                _lora_adapter=None,
+                speaker_conditioning_enabled=True,
+            )
+
         state = torch.zeros((1, 2, 8))
         with self.assertRaisesRegex(ValueError, "at least one active speaker token"):
             PreparedReferenceConditioning(
@@ -336,6 +344,16 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
             speaker_conditioning_enabled=True,
         )
         self.assertTrue(prepared.speaker_mask.any().item())
+
+    def test_disabled_speaker_conditioning_allows_none_no_ref_state(self) -> None:
+        prepared = PreparedReferenceConditioning(
+            None,
+            None,
+            _lora_adapter=None,
+            speaker_conditioning_enabled=False,
+        )
+        self.assertIsNone(prepared.speaker_state)
+        self.assertIsNone(prepared.speaker_mask)
 
     def test_model_conditioning_is_numerically_equivalent_and_encoded_once(self) -> None:
         torch.manual_seed(7)
@@ -894,6 +912,16 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         cls.adapter_spoofed_trainable_tokens = (
             Path(cls.temp_dir.name) / "adapter-spoofed-trainable-tokens"
         )
+        cls.adapter_modules_to_save_enclosing = (
+            Path(cls.temp_dir.name) / "adapter-modules-to-save-enclosing"
+        )
+        cls.adapter_target_parameters_a = (
+            Path(cls.temp_dir.name) / "adapter-target-parameters-a"
+        )
+        cls.adapter_target_parameters_b = (
+            Path(cls.temp_dir.name) / "adapter-target-parameters-b"
+        )
+        cls.adapter_unknown_lora = Path(cls.temp_dir.name) / "adapter-unknown-lora"
         cls.adapter_original_module_weight = (
             Path(cls.temp_dir.name) / "adapter-original-module-weight"
         )
@@ -949,6 +977,25 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
             scale=0.12,
             trainable_token_indices={"text_encoder.text_embedding": [1, 2]},
             trainable_token_shift=0.60,
+        )
+        cls._save_adapter(
+            cls.adapter_modules_to_save_enclosing,
+            scale=0.17,
+            target_modules=r"^out_proj$",
+            modules_to_save="speaker_encoder",
+            modules_to_save_shift=0.35,
+        )
+        cls._save_adapter(
+            cls.adapter_target_parameters_a,
+            scale=0.18,
+            target_modules=[],
+            target_parameters=["speaker_encoder.in_proj.weight"],
+        )
+        cls._save_adapter(
+            cls.adapter_target_parameters_b,
+            scale=-0.19,
+            target_modules=[],
+            target_parameters=["speaker_encoder.in_proj.weight"],
         )
         cls._save_adapter(cls.adapter_pissa, scale=0.14, init_lora_weights="pissa")
         cls._save_adapter(cls.adapter_olora, scale=-0.18, init_lora_weights="olora")
@@ -1021,6 +1068,12 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
             "base_model.model.speaker_encoder.in_proj.original_module.bias",
             cls.base_state["speaker_encoder.in_proj.bias"] + 2.0,
         )
+        cls._clone_adapter_with_state(
+            cls.adapter_a,
+            cls.adapter_unknown_lora,
+            "base_model.model.speaker_encoder.in_proj.lora_nonexistent.weight",
+            torch.ones((2, 2)),
+        )
         original_bias_config = cls.adapter_original_module_bias / "adapter_config.json"
         original_bias_payload = json.loads(original_bias_config.read_text(encoding="utf-8"))
         original_bias_payload["modules_to_save"] = ["speaker_encoder.in_proj"]
@@ -1069,6 +1122,8 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
         init_lora_weights: bool | str = True,
         rank: int = 2,
         rank_pattern: dict[str, int] | None = None,
+        target_modules: str | list[str] = r"^speaker_encoder\.in_proj$",
+        target_parameters: list[str] | None = None,
     ) -> None:
         model = TextToLatentRFDiT(cls.cfg).eval()
         model.load_state_dict(cls.base_state)
@@ -1078,10 +1133,14 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
             "lora_alpha": 2,
             "lora_dropout": 0.0,
             "lora_bias": bias,
-            "lora_target_modules": r"^speaker_encoder\.in_proj$",
+            "lora_target_modules": target_modules,
             "lora_modules_to_save": modules_to_save,
         }
-        if init_lora_weights is True and trainable_token_indices is None:
+        if (
+            init_lora_weights is True
+            and trainable_token_indices is None
+            and target_parameters is None
+        ):
             peft_model = apply_lora(model, config)
         else:
             peft_model = get_peft_model(
@@ -1093,7 +1152,8 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
                     lora_alpha=2,
                     lora_dropout=0.0,
                     bias=bias,
-                    target_modules=r"^speaker_encoder\.in_proj$",
+                    target_modules=target_modules,
+                    target_parameters=target_parameters,
                     modules_to_save=(
                         None if modules_to_save == "none" else [modules_to_save]
                     ),
@@ -1388,6 +1448,149 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
             atol=0,
         )
 
+    def test_unknown_lora_destination_is_rejected_before_peft_load(self) -> None:
+        runtime = self._runtime()
+        base_before = self._prepare(runtime, None)
+        model_before = runtime.model
+        state_before = {
+            name: tensor.detach().clone() for name, tensor in runtime.model.state_dict().items()
+        }
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=AssertionError("unknown LoRA key must not reach PEFT loading"),
+            ) as loader,
+            self.assertRaisesRegex(ValueError, "lora_nonexistent.weight"),
+        ):
+            self._prepare(runtime, self.adapter_unknown_lora)
+
+        loader.assert_not_called()
+        self.assertIs(runtime.model, model_before)
+        self.assertEqual(runtime._lora_adapter_names, {})
+        self.assertEqual(runtime._effective_conditioning_state_revision, 0)
+        self.assertIsNone(runtime._lora_load_failure)
+        for name, tensor in runtime.model.state_dict().items():
+            torch.testing.assert_close(tensor, state_before[name], rtol=0, atol=0)
+        self._synthesize_prepared(runtime, base_before, None)
+
+    def test_existing_adapter_lora_namespace_is_rejected_before_peft_load(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, self.adapter_a)
+        resolved = str(self.adapter_a.resolve())
+        existing_name = runtime._lora_adapter_names[resolved]
+        existing_a_before = (
+            runtime.model.base_model.model.speaker_encoder.in_proj.lora_A[existing_name]
+            .weight.detach()
+            .clone()
+        )
+        malicious = Path(self.temp_dir.name) / "adapter-cross-lora-namespace"
+        self._clone_adapter_with_state(
+            self.adapter_b,
+            malicious,
+            f"base_model.model.speaker_encoder.in_proj.lora_A.{existing_name}.weight",
+            existing_a_before + 4.0,
+        )
+        model_before = runtime.model
+        registry_before = runtime._lora_adapter_names.copy()
+        revision_before = runtime._effective_conditioning_state_revision
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=AssertionError("cross-adapter key must not reach PEFT loading"),
+            ) as loader,
+            self.assertRaisesRegex(ValueError, existing_name),
+        ):
+            self._prepare(runtime, malicious)
+
+        loader.assert_not_called()
+        self.assertIs(runtime.model, model_before)
+        self.assertEqual(runtime._lora_adapter_names, registry_before)
+        self.assertEqual(runtime._effective_conditioning_state_revision, revision_before)
+        self.assertIsNone(runtime._lora_load_failure)
+        torch.testing.assert_close(
+            runtime.model.base_model.model.speaker_encoder.in_proj.lora_A[
+                existing_name
+            ].weight,
+            existing_a_before,
+            rtol=0,
+            atol=0,
+        )
+        self._synthesize_prepared(runtime, prepared, self.adapter_a)
+
+    def test_noop_load_is_detected_and_poisons_runtime(self) -> None:
+        runtime = self._runtime()
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                return_value=runtime.model,
+            ),
+            self.assertRaisesRegex(RuntimeError, "may have partially changed"),
+        ):
+            self._prepare(runtime, self.adapter_a)
+
+        self.assertEqual(runtime._lora_adapter_names, {})
+        self.assertIsNotNone(runtime._lora_load_failure)
+        self.assertIn("did not apply", runtime._lora_load_failure)
+        with self.assertRaisesRegex(RuntimeError, "unavailable after a failed dynamic LoRA load"):
+            self._prepare(runtime, None)
+
+    def test_modules_to_save_enclosing_lora_target_is_rejected_cleanly(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, self.adapter_modules_to_save_enclosing)
+        model_before = runtime.model
+        registry_before = runtime._lora_adapter_names.copy()
+        revision_before = runtime._effective_conditioning_state_revision
+        state_before = {
+            name: tensor.detach().clone() for name, tensor in runtime.model.state_dict().items()
+        }
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=AssertionError("wrapper conflict must not reach PEFT loading"),
+            ) as loader,
+            self.assertRaisesRegex(ValueError, "inside existing ModulesToSaveWrapper"),
+        ):
+            self._prepare(runtime, self.adapter_a)
+
+        loader.assert_not_called()
+        self.assertIs(runtime.model, model_before)
+        self.assertEqual(runtime._lora_adapter_names, registry_before)
+        self.assertEqual(runtime._effective_conditioning_state_revision, revision_before)
+        self.assertIsNone(runtime._lora_load_failure)
+        for name, tensor in runtime.model.state_dict().items():
+            torch.testing.assert_close(tensor, state_before[name], rtol=0, atol=0)
+        self._synthesize_prepared(
+            runtime,
+            prepared,
+            self.adapter_modules_to_save_enclosing,
+        )
+        base_after = self._prepare(runtime, None)
+        self._synthesize_prepared(runtime, base_after, None)
+
+    def test_lora_then_enclosing_modules_to_save_is_rejected_cleanly(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, self.adapter_a)
+        registry_before = runtime._lora_adapter_names.copy()
+        revision_before = runtime._effective_conditioning_state_revision
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=AssertionError("wrapper conflict must not reach PEFT loading"),
+            ) as loader,
+            self.assertRaisesRegex(ValueError, "contains existing LoRA layer"),
+        ):
+            self._prepare(runtime, self.adapter_modules_to_save_enclosing)
+
+        loader.assert_not_called()
+        self.assertEqual(runtime._lora_adapter_names, registry_before)
+        self.assertEqual(runtime._effective_conditioning_state_revision, revision_before)
+        self.assertIsNone(runtime._lora_load_failure)
+        self._synthesize_prepared(runtime, prepared, self.adapter_a)
+
     def test_original_module_payload_writes_are_rejected_before_peft_load(self) -> None:
         cases = (
             (self.adapter_original_module_weight, "speaker_norm.original_module.weight"),
@@ -1423,6 +1626,108 @@ class InferenceRuntimeLoraConditioningTest(unittest.TestCase):
                 for name, tensor in runtime.model.state_dict().items():
                     torch.testing.assert_close(tensor, state_before[name], rtol=0, atol=0)
                 self._synthesize_prepared(runtime, base_before, None)
+
+    def test_trainable_tokens_then_ordinary_lora_is_rejected_cleanly(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, self.adapter_trainable_tokens)
+        registry_before = runtime._lora_adapter_names.copy()
+        revision_before = runtime._effective_conditioning_state_revision
+        state_before = {
+            name: tensor.detach().clone() for name, tensor in runtime.model.state_dict().items()
+        }
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=AssertionError("wrapper conflict must not reach PEFT loading"),
+            ) as loader,
+            self.assertRaisesRegex(ValueError, "existing TrainableTokensWrapper"),
+        ):
+            self._prepare(runtime, self.adapter_a)
+
+        loader.assert_not_called()
+        self.assertEqual(runtime._lora_adapter_names, registry_before)
+        self.assertEqual(runtime._effective_conditioning_state_revision, revision_before)
+        self.assertIsNone(runtime._lora_load_failure)
+        for name, tensor in runtime.model.state_dict().items():
+            torch.testing.assert_close(tensor, state_before[name], rtol=0, atol=0)
+        self._synthesize_prepared(runtime, prepared, self.adapter_trainable_tokens)
+        base_after = self._prepare(runtime, None)
+        self._synthesize_prepared(runtime, base_after, None)
+
+    def test_ordinary_lora_then_trainable_tokens_is_supported(self) -> None:
+        runtime = self._runtime()
+        ordinary = self._prepare(runtime, self.adapter_a)
+        trainable_tokens = self._prepare(runtime, self.adapter_trainable_tokens)
+
+        self.assertEqual(len(runtime._lora_adapter_names), 2)
+        self.assertIsNone(runtime._lora_load_failure)
+        self._synthesize_prepared(runtime, ordinary, self.adapter_a)
+        self._synthesize_prepared(
+            runtime,
+            trainable_tokens,
+            self.adapter_trainable_tokens,
+        )
+
+    def test_standalone_target_parameters_loads_and_changes_conditioning(self) -> None:
+        runtime = self._runtime()
+        base = self._prepare(runtime, None)
+        adapted = self._prepare(runtime, self.adapter_target_parameters_a)
+        resolved = str(self.adapter_target_parameters_a.resolve())
+        adapter_name = runtime._lora_adapter_names[resolved]
+
+        self.assertIn(
+            adapter_name,
+            runtime.model.base_model.model.speaker_encoder.in_proj.lora_A,
+        )
+        self.assertGreater(
+            (adapted.speaker_state - base.speaker_state).abs().max().item(),
+            1e-6,
+        )
+        self.assertIsNone(runtime._lora_load_failure)
+        self._synthesize_prepared(runtime, adapted, self.adapter_target_parameters_a)
+
+    def test_second_target_parameters_adapter_is_rejected_cleanly(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, self.adapter_target_parameters_a)
+        registry_before = runtime._lora_adapter_names.copy()
+        revision_before = runtime._effective_conditioning_state_revision
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=AssertionError("target_parameters conflict must not load"),
+            ) as loader,
+            self.assertRaisesRegex(ValueError, "only one loaded adapter with target_parameters"),
+        ):
+            self._prepare(runtime, self.adapter_target_parameters_b)
+
+        loader.assert_not_called()
+        self.assertEqual(runtime._lora_adapter_names, registry_before)
+        self.assertEqual(runtime._effective_conditioning_state_revision, revision_before)
+        self.assertIsNone(runtime._lora_load_failure)
+        self._synthesize_prepared(runtime, prepared, self.adapter_target_parameters_a)
+
+    def test_lora_wrapper_then_target_parameters_is_rejected_cleanly(self) -> None:
+        runtime = self._runtime()
+        prepared = self._prepare(runtime, self.adapter_a)
+        registry_before = runtime._lora_adapter_names.copy()
+        revision_before = runtime._effective_conditioning_state_revision
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime.load_lora_adapter",
+                side_effect=AssertionError("target_parameters conflict must not load"),
+            ) as loader,
+            self.assertRaisesRegex(ValueError, "belongs to existing LoRA wrapper"),
+        ):
+            self._prepare(runtime, self.adapter_target_parameters_a)
+
+        loader.assert_not_called()
+        self.assertEqual(runtime._lora_adapter_names, registry_before)
+        self.assertEqual(runtime._effective_conditioning_state_revision, revision_before)
+        self.assertIsNone(runtime._lora_load_failure)
+        self._synthesize_prepared(runtime, prepared, self.adapter_a)
 
     def test_trainable_tokens_load_safely_and_restore_base_exactly(self) -> None:
         runtime = self._runtime()

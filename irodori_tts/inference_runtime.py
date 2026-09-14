@@ -26,6 +26,7 @@ from .lora import (
     is_lora_adapter_dir,
     load_lora_adapter,
     preflight_lora_adapter,
+    validate_lora_adapter_applied_state,
 )
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
@@ -217,6 +218,11 @@ class PreparedReferenceConditioning:
                 "speaker_state and speaker_mask must either both be set or both be None."
             )
         if state is None:
+            if self.speaker_conditioning_enabled:
+                raise ValueError(
+                    "speaker_conditioning_enabled=True requires speaker_state and "
+                    "speaker_mask to be set."
+                )
             return
         if state.ndim != 3 or state.shape[0] != 1:
             raise ValueError(
@@ -744,6 +750,7 @@ class InferenceRuntime:
             messages.append(msg)
             log_fn(msg)
 
+        preflight = None
         if resolved_adapter_path not in self._lora_adapter_names:
             preflight = preflight_lora_adapter(
                 self.model,
@@ -762,6 +769,8 @@ class InferenceRuntime:
                 adapter_name=adapter_name,
                 torch_device=str(self.model_device),
             )
+            if preflight is not None:
+                validate_lora_adapter_applied_state(self.model, preflight)
             self.model = _move_inference_module(
                 self.model,
                 device=self.model_device,
