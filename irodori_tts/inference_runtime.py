@@ -1799,6 +1799,26 @@ class CharacterRuntimeSession:
         self._runtime: InferenceRuntime | None = None
         self._spec: _CharacterRuntimeSpec | None = None
 
+    def preload(self, key: RuntimeKey) -> RuntimePreloadInfo:
+        """Reuse a matching owned runtime or replace it with a pristine preload."""
+        with self._lock:
+            if (
+                self._runtime is not None
+                and self._spec is not None
+                and self._spec.runtime_key == key
+                and self._runtime.lifecycle_state
+                in {RuntimeLifecycle.BASE_READY, RuntimeLifecycle.CHARACTER_LOCKED}
+            ):
+                return _preload_info(self._runtime, reloaded=False)
+
+            old_runtime = self._runtime
+            self._runtime = None
+            self._spec = None
+            if old_runtime is not None:
+                old_runtime.unload()
+
+            return preload_cached_runtime(key)
+
     def acquire(
         self,
         key: RuntimeKey,

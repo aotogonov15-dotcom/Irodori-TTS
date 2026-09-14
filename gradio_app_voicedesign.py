@@ -18,7 +18,6 @@ from irodori_tts.inference_runtime import (
     default_runtime_device,
     list_available_runtime_devices,
     list_available_runtime_precisions,
-    preload_cached_runtime,
     save_wav,
 )
 from irodori_tts.speaker_inversion import is_speaker_inversion_safetensors_path
@@ -173,7 +172,7 @@ def _describe_runtime(
         codec_device=codec_device,
         codec_precision=codec_precision,
     )
-    preload = preload_cached_runtime(runtime_key)
+    preload = _RUNTIME_SESSION.preload(runtime_key)
     status = (
         "loaded model into memory"
         if preload.reloaded
