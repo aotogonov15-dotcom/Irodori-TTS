@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -402,15 +403,68 @@ def _validate_orthogonal_ranks(
     return target_names
 
 
-def _modules_to_save_names(model: torch.nn.Module, peft_config: Any) -> set[str]:
-    configured = peft_config.modules_to_save or []
-    if not configured:
-        return set()
-    return {
-        name
-        for name, _ in _unwrapped_model(model).named_modules()
-        if any(name.endswith(target) for target in configured)
-    }
+def _peft_auxiliary_payload_destinations(
+    model: torch.nn.Module,
+    peft_config: Any,
+    *,
+    adapter_name: str,
+) -> dict[str, str]:
+    """Map exact saved auxiliary keys to the state keys PEFT 0.18.1 will write."""
+    from peft.utils.other import ModulesToSaveWrapper, TrainableTokensWrapper
+
+    base_model = _unwrapped_model(model)
+    named_modules = list(base_model.named_modules(remove_duplicate=False))
+    destinations: dict[str, str] = {}
+
+    configured_modules = peft_config.modules_to_save or []
+    for name, module in named_modules:
+        if not name or not any(name.endswith(target) for target in configured_modules):
+            continue
+        if isinstance(module, ModulesToSaveWrapper):
+            storage_module = module.original_module
+        else:
+            storage_module = module
+
+        # Use PEFT's wrapper-owned source-to-destination map without mutating the live
+        # model. The proxy supplies precisely the attributes used by 0.18.1's helper.
+        proxy = SimpleNamespace(
+            _adapters={adapter_name},
+            modules_to_save={adapter_name: storage_module},
+        )
+        key_map = ModulesToSaveWrapper.adapter_state_dict_load_map(proxy, adapter_name)
+        module_name = f"base_model.model.{name}"
+        for source_suffix, destination_suffix in key_map.items():
+            destinations[f"{module_name}.{source_suffix}"] = (
+                f"{module_name}.{destination_suffix}"
+            )
+
+    trainable_token_indices = getattr(peft_config, "trainable_token_indices", None)
+    if trainable_token_indices is not None:
+        if not isinstance(trainable_token_indices, dict):
+            from peft.utils.other import _get_input_embeddings_name
+
+            input_name = _get_input_embeddings_name(base_model, "embed_tokens")
+            trainable_token_indices = {input_name: trainable_token_indices}
+
+        token_proxy = SimpleNamespace(token_adapter=SimpleNamespace(tied_adapter=None))
+        key_map = TrainableTokensWrapper.adapter_state_dict_load_map(
+            token_proxy,
+            adapter_name,
+        )
+        for target_name in trainable_token_indices:
+            matching_names = [
+                name
+                for name, _ in named_modules
+                if name and name.endswith(target_name)
+            ]
+            for name in matching_names:
+                module_name = f"base_model.model.{name}"
+                for source_suffix, destination_suffix in key_map.items():
+                    destinations[f"{module_name}.{source_suffix}"] = (
+                        f"{module_name}.{destination_suffix}"
+                    )
+
+    return destinations
 
 
 def _shared_base_bias_names(model: torch.nn.Module) -> set[str]:
@@ -430,6 +484,7 @@ def _validate_lora_adapter_state(
     bias: str,
     target_names: set[str],
     peft_config: Any,
+    adapter_name: str,
 ) -> None:
     # This is PEFT's own local-file selection and deserialization path (safetensors first,
     # then adapter_model.bin with weights_only=True), so the keys checked here are precisely
@@ -440,7 +495,11 @@ def _validate_lora_adapter_state(
     if not isinstance(state, Mapping):
         raise ValueError(f"LoRA adapter state must contain a tensor mapping: {path}")
 
-    modules_to_save = _modules_to_save_names(model, peft_config)
+    auxiliary_destinations = _peft_auxiliary_payload_destinations(
+        model,
+        peft_config,
+        adapter_name=adapter_name,
+    )
     shared_biases = _shared_base_bias_names(model)
     unsafe_keys: list[str] = []
     for key in state:
@@ -448,18 +507,27 @@ def _validate_lora_adapter_state(
             unsafe_keys.append(repr(key))
             continue
 
+        # These are exact source keys returned by PEFT's auxiliary wrapper load maps.
+        # In particular, original_module and pre-existing adapter namespaces cannot
+        # pass merely because they are located beneath the same logical module.
+        if key in auxiliary_destinations:
+            continue
+
+        # Wrapper internals are never valid serialized source paths unless PEFT's
+        # exact load map above says otherwise. Check them before the LoRA prefix,
+        # since an attacker-controlled adapter namespace can itself contain "lora_".
+        if any(
+            marker in key
+            for marker in (".original_module.", ".modules_to_save.", ".token_adapter.")
+        ):
+            unsafe_keys.append(key)
+            continue
+
         # PEFT inserts the runtime adapter name into every LoRA-prefixed state key.
         if "lora_" in key:
             continue
 
         canonical_key = _canonical_base_parameter_name(key)
-        if any(
-            canonical_key == module_name or canonical_key.startswith(f"{module_name}.")
-            for module_name in modules_to_save
-        ):
-            # PEFT remaps these keys into ModulesToSaveWrapper.modules_to_save[adapter].
-            continue
-
         if canonical_key.endswith(".bias") and canonical_key in shared_biases:
             if bias == "all":
                 continue
@@ -484,6 +552,8 @@ def _validate_lora_adapter_state(
 def preflight_lora_adapter(
     model: torch.nn.Module,
     path: str | Path,
+    *,
+    adapter_name: str = "default",
 ) -> LoraAdapterPreflight:
     """Validate config, load payload, ranks, and loaded-adapter conflicts without mutation."""
     config_path, payload, bias = _validated_lora_adapter_config(path)
@@ -513,6 +583,7 @@ def preflight_lora_adapter(
         bias=bias,
         target_names=target_names,
         peft_config=peft_config,
+        adapter_name=adapter_name,
     )
     return LoraAdapterPreflight(bias=bias)
 

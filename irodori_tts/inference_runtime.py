@@ -240,6 +240,11 @@ class PreparedReferenceConditioning:
                 "speaker_conditioning_enabled=False requires a speaker_mask with no "
                 "active speaker tokens."
             )
+        if self.speaker_conditioning_enabled and not mask.any().item():
+            raise ValueError(
+                "speaker_conditioning_enabled=True requires a speaker_mask with at least "
+                "one active speaker token."
+            )
         if state.device != mask.device:
             raise ValueError(
                 "Prepared speaker_state and speaker_mask must use the same device, "
@@ -740,7 +745,11 @@ class InferenceRuntime:
             log_fn(msg)
 
         if resolved_adapter_path not in self._lora_adapter_names:
-            preflight = preflight_lora_adapter(self.model, resolved_adapter_path)
+            preflight = preflight_lora_adapter(
+                self.model,
+                resolved_adapter_path,
+                adapter_name=adapter_name,
+            )
             if preflight.mutates_base_parameters:
                 # PEFT loads bias="all"/"lora_only" tensors into shared base parameters.
                 # Advance before loading so even a partial failed mutation invalidates old state.
