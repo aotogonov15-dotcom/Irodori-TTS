@@ -102,9 +102,7 @@ def _parse_optional_str(raw: str | None) -> str | None:
     if raw is None:
         return None
     text = str(raw).strip()
-    if text == "" or text.lower() in {"none", "null", "off", "disable", "disabled", "base"}:
-        return None
-    return text
+    return text or None
 
 
 def _format_timings(stage_timings: list[tuple[str, float]], total_to_decode: float) -> str:

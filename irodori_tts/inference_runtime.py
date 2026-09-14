@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import math
 import secrets
@@ -9,9 +8,9 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any
 
 import torch
 import torchaudio
@@ -22,9 +21,9 @@ from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .duration import build_duration_features
 from .lora import (
+    apply_preflighted_lora_adapter,
     checkpoint_state_uses_lora,
     is_lora_adapter_dir,
-    load_lora_adapter,
     preflight_lora_adapter,
     validate_lora_adapter_applied_state,
 )
@@ -196,6 +195,20 @@ class RuntimeKey:
     compile_dynamic: bool = False
 
 
+class RuntimeLifecycle(str, Enum):
+    BASE_READY = "base_ready"
+    LOADING = "loading"
+    CHARACTER_LOCKED = "character_locked"
+    FAILED = "failed"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True)
+class _CharacterLoraRequest:
+    explicit: bool
+    adapter_path: str | None
+
+
 @dataclass(frozen=True)
 class PreparedReferenceConditioning:
     """Text-independent speaker/style state owned by one inference runtime."""
@@ -204,13 +217,11 @@ class PreparedReferenceConditioning:
     speaker_mask: torch.Tensor | None
     _lora_adapter: str | None
     speaker_conditioning_enabled: bool = True
-    _effective_conditioning_state_revision: int = 0
+    _runtime_owner_token: object | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.speaker_conditioning_enabled, bool):
             raise ValueError("speaker_conditioning_enabled must be bool.")
-        if self._effective_conditioning_state_revision < 0:
-            raise ValueError("effective conditioning state revision must be non-negative.")
         state = self.speaker_state
         mask = self.speaker_mask
         if (state is None) != (mask is None):
@@ -579,9 +590,11 @@ class InferenceRuntime:
         self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
         self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
-        self._lora_adapter_names: dict[str, str] = {}
-        self._effective_conditioning_state_revision = 0
-        self._lora_load_failure: str | None = None
+        self._lifecycle_state = RuntimeLifecycle.BASE_READY
+        self._runtime_owner_token = object()
+        self._character_lora_adapter: str | None = None
+        self._character_adapter_name: str | None = None
+        self._failure_reason: str | None = None
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -671,43 +684,84 @@ class InferenceRuntime:
             default_caption_max_len=default_caption_max_len,
         )
 
-    def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
+    @property
+    def lifecycle_state(self) -> RuntimeLifecycle:
+        return self._lifecycle_state
+
+    @property
+    def character_lora_adapter(self) -> str | None:
+        return self._character_lora_adapter
+
+    @staticmethod
+    def _parse_character_lora_request(adapter_path: str | None) -> _CharacterLoraRequest:
         if adapter_path is None:
-            return None
+            return _CharacterLoraRequest(explicit=False, adapter_path=None)
         raw = str(adapter_path).strip()
         if raw.lower() in {"", "none", "null", "off", "disable", "disabled", "base"}:
-            return None
+            return _CharacterLoraRequest(explicit=True, adapter_path=None)
 
-        path = Path(raw).expanduser()
+        path = Path(raw).expanduser().resolve(strict=False)
+        return _CharacterLoraRequest(explicit=True, adapter_path=str(path))
+
+    @staticmethod
+    def _validate_character_lora_path(adapter_path: str) -> None:
+        path = Path(adapter_path)
+
         if not path.is_dir():
             raise FileNotFoundError(f"LoRA adapter directory not found: {path}")
         if not is_lora_adapter_dir(path):
             raise ValueError(
                 f"LoRA adapter directory must contain adapter_config.json and adapter weights: {path}"
             )
-        return str(path.resolve())
 
-    @staticmethod
-    def _adapter_name_for_path(path: str) -> str:
-        digest = hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
-        return f"runtime_{digest}"
+    def _raise_for_unusable_state(self) -> None:
+        if self._lifecycle_state == RuntimeLifecycle.FAILED:
+            raise RuntimeError(
+                "This inference runtime is in FAILED state after character LoRA mutation; "
+                "destroy and recreate it before another request. "
+                f"Original failure: {self._failure_reason}"
+            )
+        if self._lifecycle_state == RuntimeLifecycle.CLOSED:
+            raise RuntimeError("This inference runtime is CLOSED and cannot be used.")
+        if self._lifecycle_state == RuntimeLifecycle.LOADING:
+            raise RuntimeError("This inference runtime is still LOADING its character LoRA.")
+
+    def finalize_character(self, lora_adapter: str | None = None) -> None:
+        """Finalize this runtime for exactly one character, with zero or one LoRA."""
+        request = self._parse_character_lora_request(lora_adapter)
+        with self._infer_lock:
+            if self._lifecycle_state != RuntimeLifecycle.BASE_READY:
+                self._raise_for_unusable_state()
+                raise RuntimeError(
+                    "Character state is already locked and immutable for this runtime; "
+                    "create a fresh runtime to change or reload LoRA state."
+                )
+            self._finalize_character_inner(
+                request.adapter_path,
+                messages=[],
+                log_fn=lambda _message: None,
+            )
 
     def _prepare_lora_for_request(
         self,
-        resolved_adapter_path: str | None,
+        request: _CharacterLoraRequest,
         *,
         messages: list[str],
         stage_timings: list[tuple[str, float]],
         log_fn: Callable[[str], None],
-    ) -> Any:
-        should_time = resolved_adapter_path is not None
+    ) -> nullcontext:
+        should_time = (
+            self._lifecycle_state == RuntimeLifecycle.BASE_READY
+            and request.adapter_path is not None
+        )
         t0 = _measure_start(self.model_device) if should_time else None
         try:
-            return self._prepare_lora_for_request_inner(
-                resolved_adapter_path,
+            self._prepare_lora_for_request_inner(
+                request,
                 messages=messages,
                 log_fn=log_fn,
             )
+            return nullcontext()
         finally:
             if t0 is not None:
                 stage_sec = _measure_end(self.model_device, t0)
@@ -716,75 +770,83 @@ class InferenceRuntime:
 
     def _prepare_lora_for_request_inner(
         self,
+        request: _CharacterLoraRequest,
+        *,
+        messages: list[str],
+        log_fn: Callable[[str], None],
+    ) -> None:
+        self._raise_for_unusable_state()
+        if self._lifecycle_state == RuntimeLifecycle.BASE_READY:
+            self._finalize_character_inner(
+                request.adapter_path,
+                messages=messages,
+                log_fn=log_fn,
+            )
+            return
+
+        assert self._lifecycle_state == RuntimeLifecycle.CHARACTER_LOCKED
+        if request.explicit and request.adapter_path is None:
+            raise RuntimeError(
+                "Character LoRA state is immutable after lock; switching to base/off is rejected."
+            )
+        if request.explicit and request.adapter_path != self._character_lora_adapter:
+            raise RuntimeError(
+                "Character LoRA state is immutable after lock; adapter switching is rejected."
+            )
+
+    def _finalize_character_inner(
+        self,
         resolved_adapter_path: str | None,
         *,
         messages: list[str],
         log_fn: Callable[[str], None],
-    ) -> Any:
-        if self._lora_load_failure is not None:
-            raise RuntimeError(
-                "This inference runtime is unavailable after a failed dynamic LoRA load; "
-                "reload the runtime before another request. "
-                f"Original failure: {self._lora_load_failure}"
-            )
+    ) -> None:
+        if self._lifecycle_state != RuntimeLifecycle.BASE_READY:
+            raise RuntimeError("Character finalization requires a BASE_READY runtime.")
         if resolved_adapter_path is None:
-            disable_adapter = getattr(self.model, "disable_adapter", None)
-            if callable(disable_adapter):
-                msg = "info: dynamic LoRA disabled for this request; using base model."
-                messages.append(msg)
-                log_fn(msg)
-                return disable_adapter()
-            return nullcontext()
+            self._character_lora_adapter = None
+            self._character_adapter_name = None
+            self._lifecycle_state = RuntimeLifecycle.CHARACTER_LOCKED
+            _detach_cached_runtime(self)
+            return
 
         if self.key.compile_model:
-            raise RuntimeError("Dynamic LoRA loading is not compatible with compile_model=True.")
+            raise RuntimeError("Character LoRA loading is not compatible with compile_model=True.")
+        self._validate_character_lora_path(resolved_adapter_path)
+        adapter_name = "character"
+        msg = f"info: loading character LoRA adapter: {resolved_adapter_path}"
+        messages.append(msg)
+        log_fn(msg)
 
-        adapter_name = self._lora_adapter_names.get(resolved_adapter_path)
-        if adapter_name is None:
-            adapter_name = self._adapter_name_for_path(resolved_adapter_path)
-            msg = f"info: loading LoRA adapter: {resolved_adapter_path}"
-            messages.append(msg)
-            log_fn(msg)
-        else:
-            msg = f"info: using cached LoRA adapter: {resolved_adapter_path}"
-            messages.append(msg)
-            log_fn(msg)
-
-        preflight = None
-        if resolved_adapter_path not in self._lora_adapter_names:
-            preflight = preflight_lora_adapter(
-                self.model,
-                resolved_adapter_path,
-                adapter_name=adapter_name,
-            )
-            if preflight.mutates_base_parameters:
-                # PEFT loads bias="all"/"lora_only" tensors into shared base parameters.
-                # Advance before loading so even a partial failed mutation invalidates old state.
-                self._effective_conditioning_state_revision += 1
+        preflight = preflight_lora_adapter(
+            self.model,
+            resolved_adapter_path,
+            adapter_name=adapter_name,
+        )
+        self._lifecycle_state = RuntimeLifecycle.LOADING
+        _detach_cached_runtime(self)
         try:
-            self.model = load_lora_adapter(
-                self.model,
-                resolved_adapter_path,
-                is_trainable=False,
-                adapter_name=adapter_name,
-                torch_device=str(self.model_device),
-            )
-            if preflight is not None:
-                validate_lora_adapter_applied_state(self.model, preflight)
+            self.model = apply_preflighted_lora_adapter(self.model, preflight)
             self.model = _move_inference_module(
                 self.model,
                 device=self.model_device,
                 dtype=self._model_dtype,
             )
             self.model.eval()
+            validate_lora_adapter_applied_state(self.model, preflight)
         except Exception as exc:
-            self._lora_load_failure = f"{type(exc).__name__}: {exc}"
+            self._failure_reason = f"{type(exc).__name__}: {exc}"
+            self._lifecycle_state = RuntimeLifecycle.FAILED
+            _detach_cached_runtime(self)
             raise RuntimeError(
-                "Dynamic LoRA adapter loading failed and may have partially changed the model; "
-                "reload the inference runtime before another request."
+                "Character LoRA loading failed after PEFT mutation began; the runtime is "
+                "now FAILED and must be destroyed/recreated."
             ) from exc
-        self._lora_adapter_names[resolved_adapter_path] = adapter_name
-        return nullcontext()
+
+        self._character_lora_adapter = resolved_adapter_path
+        self._character_adapter_name = adapter_name
+        self._lifecycle_state = RuntimeLifecycle.CHARACTER_LOCKED
+        _detach_cached_runtime(self)
 
     def _load_reference_latent(
         self,
@@ -960,9 +1022,7 @@ class InferenceRuntime:
             speaker_conditioning_enabled=bool(
                 self.model_cfg.use_speaker_condition_resolved and not req.no_ref
             ),
-            _effective_conditioning_state_revision=(
-                self._effective_conditioning_state_revision
-            ),
+            _runtime_owner_token=self._runtime_owner_token,
         )
 
     def prepare_reference_conditioning(
@@ -992,7 +1052,7 @@ class InferenceRuntime:
         )
         messages: list[str] = []
         stage_timings: list[tuple[str, float]] = []
-        effective_lora_adapter = self._resolve_lora_adapter_path(lora_adapter)
+        lora_request = self._parse_character_lora_request(lora_adapter)
 
         def _log(message: str) -> None:
             if log_fn is not None:
@@ -1001,13 +1061,14 @@ class InferenceRuntime:
         with (
             self._infer_lock,
             self._prepare_lora_for_request(
-                effective_lora_adapter,
+                lora_request,
                 messages=messages,
                 stage_timings=stage_timings,
                 log_fn=_log,
             ),
             torch.inference_mode(),
         ):
+            effective_lora_adapter = self._character_lora_adapter
             msg_count_before_ref = len(messages)
             prepared = self._prepare_reference_conditioning_for_request(
                 req=req,
@@ -1035,19 +1096,15 @@ class InferenceRuntime:
             "Prepare the reference again with the same lora_adapter."
         )
 
-    def _validate_prepared_effective_conditioning_state(
+    def _validate_prepared_runtime_owner(
         self,
         prepared: PreparedReferenceConditioning,
     ) -> None:
-        if (
-            prepared._effective_conditioning_state_revision
-            == self._effective_conditioning_state_revision
-        ):
+        if prepared._runtime_owner_token is self._runtime_owner_token:
             return
         raise ValueError(
-            "Prepared reference conditioning model-state mismatch: the effective "
-            "speaker-conditioning state changed after this reference was prepared. "
-            "Prepare the reference again for the current runtime state."
+            "Prepared reference conditioning runtime-owner mismatch: prepare the reference "
+            "again with this character runtime."
         )
 
     def _expand_prepared_reference(
@@ -1149,12 +1206,7 @@ class InferenceRuntime:
             raise ValueError(
                 "prepared_reference cannot be combined with ref_wav/ref_latent/ref_embed/no_ref."
             )
-        effective_lora_adapter = self._resolve_lora_adapter_path(req.lora_adapter)
-        if prepared_reference is not None:
-            self._validate_prepared_lora_adapter(
-                prepared_reference,
-                effective_lora_adapter=effective_lora_adapter,
-            )
+        lora_request = self._parse_character_lora_request(req.lora_adapter)
 
         raw_text = str(req.text)
         normalized_text = normalize_text(raw_text).strip()
@@ -1257,15 +1309,20 @@ class InferenceRuntime:
         with (
             self._infer_lock,
             self._prepare_lora_for_request(
-                effective_lora_adapter,
+                lora_request,
                 messages=messages,
                 stage_timings=stage_timings,
                 log_fn=_log,
             ),
             torch.inference_mode(),
         ):
+            effective_lora_adapter = self._character_lora_adapter
             if prepared_reference is not None:
-                self._validate_prepared_effective_conditioning_state(prepared_reference)
+                self._validate_prepared_runtime_owner(prepared_reference)
+                self._validate_prepared_lora_adapter(
+                    prepared_reference,
+                    effective_lora_adapter=effective_lora_adapter,
+                )
             t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
                 [normalized_text] * num_candidates,
@@ -1519,13 +1576,14 @@ class InferenceRuntime:
                 _log(msg)
 
             total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+            sample_rate = int(self.codec.sample_rate)
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
         _log("[runtime] done synthesize")
         return SamplingResult(
             audio=trimmed_audios[0],
             audios=trimmed_audios,
-            sample_rate=int(self.codec.sample_rate),
+            sample_rate=sample_rate,
             stage_timings=stage_timings,
             total_to_decode=total_to_decode,
             used_seed=used_seed,
@@ -1533,21 +1591,29 @@ class InferenceRuntime:
         )
 
     def unload(self) -> None:
-        del self.model
-        del self.tokenizer
-        del self.codec
-        gc.collect()
-        for device in (self.model_device, self.codec_device):
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-            elif device.type == "mps":
-                mps = getattr(torch, "mps", None)
-                if mps is not None and hasattr(mps, "empty_cache"):
-                    mps.empty_cache()
-            elif device.type == "xpu":
-                xpu = getattr(torch, "xpu", None)
-                if xpu is not None and hasattr(xpu, "empty_cache"):
-                    xpu.empty_cache()
+        with self._infer_lock:
+            if self._lifecycle_state == RuntimeLifecycle.CLOSED:
+                return
+            self._lifecycle_state = RuntimeLifecycle.CLOSED
+            _detach_cached_runtime(self)
+            if hasattr(self, "model"):
+                del self.model
+            if hasattr(self, "tokenizer"):
+                del self.tokenizer
+            if hasattr(self, "codec"):
+                del self.codec
+            gc.collect()
+            for device in (self.model_device, self.codec_device):
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                elif device.type == "mps":
+                    mps = getattr(torch, "mps", None)
+                    if mps is not None and hasattr(mps, "empty_cache"):
+                        mps.empty_cache()
+                elif device.type == "xpu":
+                    xpu = getattr(torch, "xpu", None)
+                    if xpu is not None and hasattr(xpu, "empty_cache"):
+                        xpu.empty_cache()
 
 
 _RUNTIME_CACHE_LOCK = threading.Lock()
@@ -1555,10 +1621,23 @@ _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
 
 
+def _detach_cached_runtime(runtime: InferenceRuntime) -> None:
+    """Remove a claimed/terminal runtime from the pristine-base cache."""
+    global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
+    with _RUNTIME_CACHE_LOCK:
+        if _RUNTIME_CACHE_VALUE is runtime:
+            _RUNTIME_CACHE_KEY = None
+            _RUNTIME_CACHE_VALUE = None
+
+
 def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
     with _RUNTIME_CACHE_LOCK:
-        if _RUNTIME_CACHE_VALUE is not None and _RUNTIME_CACHE_KEY == key:
+        if (
+            _RUNTIME_CACHE_VALUE is not None
+            and _RUNTIME_CACHE_KEY == key
+            and _RUNTIME_CACHE_VALUE.lifecycle_state == RuntimeLifecycle.BASE_READY
+        ):
             return _RUNTIME_CACHE_VALUE, False
 
         old_runtime = _RUNTIME_CACHE_VALUE
@@ -1566,7 +1645,10 @@ def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
 
-    if old_runtime is not None:
+    if (
+        old_runtime is not None
+        and old_runtime.lifecycle_state == RuntimeLifecycle.BASE_READY
+    ):
         old_runtime.unload()
 
     return runtime, True

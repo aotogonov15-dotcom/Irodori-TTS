@@ -27,33 +27,60 @@ LORA_ADAPTER_STATE_NAMES = ("adapter_model.safetensors", "adapter_model.bin")
 LORA_TRAINER_STATE_NAME = "trainer_state.pt"
 LORA_METADATA_NAME = "irodori_lora_metadata.json"
 
-_SAFE_DYNAMIC_LORA_INITIALIZATIONS = {
-    "gaussian",
-    "eva",
-    "orthogonal",
-}
-_SUPPORTED_LORA_BIASES = {
-    "none",
-    "all",
-    "lora_only",
-}
-_BASE_MUTATING_LORA_INITIALIZATIONS = {
-    "olora",
-    "corda",
-    "loftq",
+CHARACTER_LORA_R = 16
+CHARACTER_LORA_ALPHA = 32
+CHARACTER_LORA_DROPOUT = 0.0
+CHARACTER_LORA_MODULES_TO_SAVE = ("duration_predictor",)
+
+_KNOWN_CHARACTER_LORA_CONFIG_FIELDS = {
+    "alora_invocation_tokens",
+    "alpha_pattern",
+    "arrow_config",
+    "auto_mapping",
+    "base_model_name_or_path",
+    "bias",
+    "corda_config",
+    "ensure_weight_tying",
+    "eva_config",
+    "exclude_modules",
+    "fan_in_fan_out",
+    "inference_mode",
+    "init_lora_weights",
+    "layer_replication",
+    "layers_pattern",
+    "layers_to_transform",
+    "loftq_config",
+    "lora_alpha",
+    "lora_bias",
+    "lora_dropout",
+    "megatron_config",
+    "megatron_core",
+    "modules_to_save",
+    "peft_type",
+    "peft_version",
+    "qalora_group_size",
+    "r",
+    "rank_pattern",
+    "revision",
+    "target_modules",
+    "target_parameters",
+    "task_type",
+    "trainable_token_indices",
+    "use_dora",
+    "use_qalora",
+    "use_rslora",
 }
 
 
 @dataclass(frozen=True)
 class LoraAdapterPreflight:
-    """Dynamic-loading facts validated before PEFT can mutate the model."""
+    """Complete character-adapter input validated before PEFT mutation."""
 
-    bias: str
+    adapter_name: str
+    peft_config: Any
+    adapter_state: tuple[tuple[str, torch.Tensor], ...]
     expected_applied_state: tuple[tuple[str, torch.Tensor], ...]
 
-    @property
-    def mutates_base_parameters(self) -> bool:
-        return self.bias != "none"
 
 LORA_TARGET_PRESETS: dict[str, str] = {
     "text_attn_mlp": (
@@ -273,7 +300,18 @@ def is_lora_adapter_dir(path: str | Path) -> bool:
     return any((candidate / name).is_file() for name in LORA_ADAPTER_STATE_NAMES)
 
 
-def _validated_lora_adapter_config(path: str | Path) -> tuple[Path, dict[str, Any], str]:
+def _character_lora_error(config_path: Path, detail: str) -> ValueError:
+    return ValueError(
+        "Unsupported character LoRA adapter configuration for the B1 inference runtime: "
+        f"{detail} ({config_path})."
+    )
+
+
+def _is_none_or_empty(value: Any) -> bool:
+    return value is None or value == [] or value == {}
+
+
+def _validated_character_lora_adapter_config(path: str | Path) -> Any:
     config_path = Path(path) / LORA_ADAPTER_CONFIG_NAME
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -282,45 +320,119 @@ def _validated_lora_adapter_config(path: str | Path) -> tuple[Path, dict[str, An
     if not isinstance(payload, dict):
         raise ValueError(f"LoRA adapter config must contain a JSON object: {config_path}")
 
-    raw_initialization = payload.get("init_lora_weights", True)
-    initialization_is_safe = isinstance(raw_initialization, bool) or (
-        isinstance(raw_initialization, str)
-        and raw_initialization in _SAFE_DYNAMIC_LORA_INITIALIZATIONS
-    )
+    unknown_fields = sorted(set(payload) - _KNOWN_CHARACTER_LORA_CONFIG_FIELDS)
+    if unknown_fields:
+        raise _character_lora_error(
+            config_path,
+            f"unknown PEFT fields are not accepted: {unknown_fields}",
+        )
+    if payload.get("peft_type", "LORA") != "LORA":
+        raise _character_lora_error(config_path, "peft_type must be 'LORA'")
+    if payload.get("init_lora_weights", True) is not True:
+        raise _character_lora_error(config_path, "init_lora_weights must be exactly true")
+    if payload.get("bias", "none") != "none":
+        raise _character_lora_error(config_path, "bias must be exactly 'none'")
+    if payload.get("lora_bias", False) is not False:
+        raise _character_lora_error(config_path, "lora_bias must be false")
 
-    mutates_base = isinstance(raw_initialization, str) and (
-        raw_initialization == "pissa"
-        or raw_initialization.startswith("pissa_niter_")
-        or raw_initialization in _BASE_MUTATING_LORA_INITIALIZATIONS
-    )
-    if mutates_base:
-        raise ValueError(
-            "Unsupported LoRA adapter configuration for dynamic runtime LoRA: "
-            f"init_lora_weights={raw_initialization!r} in {config_path} can persistently "
-            "modify shared base parameters, so disabling the adapter cannot guarantee "
-            "restoration of the effective base model."
+    rank_pattern = payload.get("rank_pattern", {})
+    alpha_pattern = payload.get("alpha_pattern", {})
+    if not isinstance(rank_pattern, dict) or rank_pattern:
+        raise _character_lora_error(config_path, "rank_pattern must be an empty object")
+    if not isinstance(alpha_pattern, dict) or alpha_pattern:
+        raise _character_lora_error(config_path, "alpha_pattern must be an empty object")
+
+    rank = payload.get("r")
+    alpha = payload.get("lora_alpha")
+    dropout = payload.get("lora_dropout", CHARACTER_LORA_DROPOUT)
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank != CHARACTER_LORA_R:
+        raise _character_lora_error(config_path, f"r must be {CHARACTER_LORA_R}")
+    if not isinstance(alpha, int) or isinstance(alpha, bool) or alpha != CHARACTER_LORA_ALPHA:
+        raise _character_lora_error(
+            config_path,
+            f"lora_alpha must be {CHARACTER_LORA_ALPHA}",
         )
-    if not initialization_is_safe:
-        raise ValueError(
-            "Unsupported LoRA adapter configuration for dynamic runtime LoRA: "
-            f"init_lora_weights={raw_initialization!r} in {config_path} is not a "
-            "recognized non-mutating initialization, so safe base restoration cannot "
-            "be proven."
+    if (
+        not isinstance(dropout, (int, float))
+        or isinstance(dropout, bool)
+        or float(dropout) != CHARACTER_LORA_DROPOUT
+    ):
+        raise _character_lora_error(
+            config_path,
+            f"lora_dropout must be {CHARACTER_LORA_DROPOUT}",
         )
 
-    bias = payload.get("bias", "none")
-    if not isinstance(bias, str) or bias not in _SUPPORTED_LORA_BIASES:
-        raise ValueError(
-            f"Unsupported LoRA adapter bias={bias!r} in {config_path}. "
-            "Expected an exact canonical value from: none, all, lora_only."
+    target_modules = payload.get("target_modules")
+    target_modules_valid = (
+        isinstance(target_modules, str) and bool(target_modules.strip())
+    ) or (
+        isinstance(target_modules, list)
+        and bool(target_modules)
+        and all(isinstance(item, str) and bool(item.strip()) for item in target_modules)
+    )
+    if not target_modules_valid:
+        raise _character_lora_error(
+            config_path,
+            "target_modules must identify at least one supported nn.Linear",
         )
-    return config_path, payload, bias
+
+    modules_to_save = payload.get("modules_to_save")
+    if modules_to_save is None:
+        normalized_modules_to_save: tuple[str, ...] = ()
+    elif isinstance(modules_to_save, list) and all(
+        isinstance(item, str) for item in modules_to_save
+    ):
+        normalized_modules_to_save = tuple(modules_to_save)
+    else:
+        raise _character_lora_error(
+            config_path,
+            "modules_to_save must be null or ['duration_predictor']",
+        )
+    if normalized_modules_to_save not in ((), CHARACTER_LORA_MODULES_TO_SAVE):
+        raise _character_lora_error(
+            config_path,
+            "modules_to_save must be null or exactly ['duration_predictor']",
+        )
+
+    for field in (
+        "ensure_weight_tying",
+        "fan_in_fan_out",
+        "use_dora",
+        "use_qalora",
+        "use_rslora",
+    ):
+        if payload.get(field, False) is not False:
+            raise _character_lora_error(config_path, f"{field} is not supported")
+
+    for field in (
+        "alora_invocation_tokens",
+        "arrow_config",
+        "corda_config",
+        "eva_config",
+        "exclude_modules",
+        "layer_replication",
+        "layers_pattern",
+        "layers_to_transform",
+        "loftq_config",
+        "megatron_config",
+        "target_parameters",
+        "trainable_token_indices",
+    ):
+        if not _is_none_or_empty(payload.get(field)):
+            raise _character_lora_error(config_path, f"{field} is not supported")
+    if payload.get("task_type") is not None:
+        raise _character_lora_error(config_path, "task_type must be null")
+
+    lora_config_cls, _, _ = _require_peft()
+    peft_config = lora_config_cls.from_peft_type(**payload)
+    peft_config.inference_mode = True
+    return peft_config
 
 
 def lora_adapter_mutates_base_parameters(path: str | Path) -> bool:
-    """Validate config-only safety and report supported persistent bias mutation."""
-    _, _, bias = _validated_lora_adapter_config(path)
-    return bias != "none"
+    """Validate the character-runtime config boundary; supported adapters never mutate base."""
+    _validated_character_lora_adapter_config(path)
+    return False
 
 
 def _unwrapped_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -330,24 +442,8 @@ def _unwrapped_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-def _canonical_base_parameter_name(name: str) -> str:
-    for prefix in ("base_model.model.", "base_model."):
-        if name.startswith(prefix):
-            name = name.removeprefix(prefix)
-            break
-    while ".base_layer." in name:
-        name = name.replace(".base_layer.", ".")
-    while ".original_module." in name:
-        name = name.replace(".original_module.", ".")
-    return name
-
-
 def _peft_target_module_names(model: torch.nn.Module, peft_config: Any) -> set[str]:
-    # These are the same matching helpers and existing-adapter exclusion used by PEFT 0.18.1
-    # while injecting a LoRA adapter. Keeping this dry-run tied to PEFT avoids subtly different
-    # rank_pattern behavior.
     from peft.tuners.tuners_utils import (
-        BaseTunerLayer,
         _ExcludedModule,
         _maybe_include_all_linear_layers,
         check_target_module_exists,
@@ -355,282 +451,124 @@ def _peft_target_module_names(model: torch.nn.Module, peft_config: Any) -> set[s
 
     base_model = _unwrapped_model(model)
     peft_config = _maybe_include_all_linear_layers(peft_config, base_model)
-    named_modules = list(base_model.named_modules())
-    existing_adapter_prefixes = [
-        f"{name}." for name, module in named_modules if isinstance(module, BaseTunerLayer)
-    ]
     targets: set[str] = set()
-    for name, _ in named_modules:
-        if not name or any(name.startswith(prefix) for prefix in existing_adapter_prefixes):
+    for name, _ in base_model.named_modules():
+        if not name:
             continue
         match = check_target_module_exists(peft_config, name)
         if match and not isinstance(match, _ExcludedModule):
             targets.add(name)
-
     return targets
 
 
-def _peft_target_parameter_names(model: torch.nn.Module, peft_config: Any) -> set[str]:
-    target_parameters = getattr(peft_config, "target_parameters", None) or []
-    if not target_parameters:
-        return set()
-
-    return {
-        canonical_name
-        for name, _ in _unwrapped_model(model).named_parameters()
-        if ".lora_" not in name and ".modules_to_save." not in name
-        for canonical_name in (_canonical_base_parameter_name(name),)
-        if canonical_name in target_parameters
-        or any(canonical_name.endswith(f".{target}") for target in target_parameters)
-    }
-
-
-def _validate_wrapper_topology(
-    model: torch.nn.Module,
-    peft_config: Any,
-    *,
-    loaded_configs: Mapping[str, Any],
-) -> set[str]:
-    """Reject PEFT 0.18.1 wrapper combinations known to mutate before failing."""
-    from peft.tuners.tuners_utils import (
-        BaseTunerLayer,
-        _ExcludedModule,
-        check_target_module_exists,
-    )
-    from peft.utils.other import ModulesToSaveWrapper
-
-    base_model = _unwrapped_model(model)
-    named_modules = list(base_model.named_modules(remove_duplicate=False))
-
-    target_parameters = getattr(peft_config, "target_parameters", None) or []
-    if target_parameters and any(
-        getattr(config, "target_parameters", None) for config in loaded_configs.values()
-    ):
-        raise ValueError(
-            "Unsupported LoRA adapter combination for dynamic runtime LoRA: PEFT 0.18.1 "
-            "supports only one loaded adapter with target_parameters."
-        )
-
-    # A ModulesToSaveWrapper hides its original descendants below `.original_module`.
-    # PEFT's target matcher therefore misses a later adapter targeting the wrapper or
-    # one of those logical descendants and can report success without adding LoRA state.
-    for wrapper_name, module in named_modules:
-        if not wrapper_name or not isinstance(module, ModulesToSaveWrapper):
-            continue
-        logical_modules = (
-            wrapper_name if not suffix else f"{wrapper_name}.{suffix}"
-            for suffix, _ in module.original_module.named_modules()
-        )
-        for logical_name in logical_modules:
-            match = check_target_module_exists(peft_config, logical_name)
-            if match and not isinstance(match, _ExcludedModule):
-                raise ValueError(
-                    "Unsupported LoRA adapter topology for dynamic runtime LoRA: target module "
-                    f"{logical_name!r} is inside existing ModulesToSaveWrapper {wrapper_name!r}."
-                )
-
-        for suffix, _ in module.original_module.named_parameters():
-            logical_name = f"{wrapper_name}.{suffix}"
-            if logical_name in target_parameters or any(
-                logical_name.endswith(f".{target}") for target in target_parameters
-            ):
-                raise ValueError(
-                    "Unsupported LoRA adapter topology for dynamic runtime LoRA: target parameter "
-                    f"{logical_name!r} is inside existing ModulesToSaveWrapper {wrapper_name!r}."
-                )
-
-    # Wrapping a module that already contains LoRA storage copies/nests another
-    # adapter's topology. B1 does not need that composition, so reject it cleanly.
-    configured_modules = peft_config.modules_to_save or []
-    modules_to_save_names = {
-        name
-        for name, _ in named_modules
-        if name and any(name.endswith(target) for target in configured_modules)
-    }
-    for saved_name in modules_to_save_names:
-        for existing_name, module in named_modules:
-            if not isinstance(module, BaseTunerLayer):
-                continue
-            if existing_name == saved_name or existing_name.startswith(f"{saved_name}."):
-                raise ValueError(
-                    "Unsupported LoRA adapter topology for dynamic runtime LoRA: "
-                    f"modules_to_save target {saved_name!r} contains existing LoRA layer "
-                    f"{existing_name!r}."
-                )
-
-    matched_parameters = _peft_target_parameter_names(model, peft_config)
-    for parameter_name in sorted(matched_parameters):
-        module_name, _, _ = parameter_name.rpartition(".")
-        try:
-            module = base_model.get_submodule(module_name)
-        except AttributeError:
-            continue
-        if isinstance(module, BaseTunerLayer) and module.__class__.__name__ != "ParamWrapper":
-            raise ValueError(
-                "Unsupported LoRA adapter topology for dynamic runtime LoRA: target_parameters "
-                f"entry {parameter_name!r} belongs to existing LoRA wrapper {module_name!r}."
-            )
-    return matched_parameters
-
-
-def _has_trainable_tokens_wrapper(model: torch.nn.Module) -> bool:
-    from peft.utils.other import TrainableTokensWrapper
-
-    return any(
-        isinstance(module, TrainableTokensWrapper)
-        for module in _unwrapped_model(model).modules()
-    )
-
-
-def _validate_orthogonal_ranks(
+def _validate_character_target_modules(
     model: torch.nn.Module,
     peft_config: Any,
     *,
     config_path: Path,
 ) -> set[str]:
-    from peft.utils.other import get_pattern_key
+    _, peft_model_cls, _ = _require_peft()
+    if isinstance(model, peft_model_cls) or getattr(model, "peft_config", None):
+        raise _character_lora_error(
+            config_path,
+            "the runtime model already contains PEFT adapter state",
+        )
 
-    target_names = _peft_target_module_names(model, peft_config)
-    rank_targets = target_names | _peft_target_parameter_names(model, peft_config)
-    rank_pattern = peft_config.rank_pattern
-    for target_name in sorted(rank_targets):
-        rank_key = get_pattern_key(rank_pattern.keys(), target_name)
-        rank = rank_pattern.get(rank_key, peft_config.r)
-        if rank % 2:
-            raise ValueError(
-                "Unsupported LoRA adapter configuration for dynamic runtime LoRA: "
-                f"orthogonal initialization requires an even effective rank, but {target_name!r} "
-                f"receives r={rank} in {config_path}."
+    base_model = _unwrapped_model(model)
+    target_names = _peft_target_module_names(base_model, peft_config)
+    if not target_names:
+        raise _character_lora_error(config_path, "target_modules matched no model module")
+
+    unsupported = sorted(
+        name
+        for name in target_names
+        if not isinstance(base_model.get_submodule(name), torch.nn.Linear)
+    )
+    if unsupported:
+        raise _character_lora_error(
+            config_path,
+            f"only ordinary nn.Linear targets are supported, got {unsupported[:3]}",
+        )
+
+    if peft_config.modules_to_save:
+        try:
+            base_model.get_submodule("duration_predictor")
+        except AttributeError as exc:
+            raise _character_lora_error(
+                config_path,
+                "modules_to_save requests duration_predictor but the model has none",
+            ) from exc
+        conflicts = sorted(
+            name
+            for name in target_names
+            if name == "duration_predictor" or name.startswith("duration_predictor.")
+        )
+        if conflicts:
+            raise _character_lora_error(
+                config_path,
+                "duration_predictor cannot be both a LoRA target and modules_to_save",
             )
     return target_names
 
 
-def _peft_auxiliary_payload_destinations(
+def _expected_lora_destination_shapes(
     model: torch.nn.Module,
-    peft_config: Any,
     *,
     adapter_name: str,
-) -> dict[str, str]:
-    """Map exact saved auxiliary keys to the state keys PEFT 0.18.1 will write."""
-    from peft.utils.other import ModulesToSaveWrapper, TrainableTokensWrapper
-
+    target_names: set[str],
+    rank: int,
+) -> dict[str, torch.Size]:
     base_model = _unwrapped_model(model)
-    named_modules = list(base_model.named_modules(remove_duplicate=False))
-    destinations: dict[str, str] = {}
-
-    configured_modules = peft_config.modules_to_save or []
-    for name, module in named_modules:
-        if not name or not any(name.endswith(target) for target in configured_modules):
-            continue
-        if isinstance(module, ModulesToSaveWrapper):
-            storage_module = module.original_module
-        else:
-            storage_module = module
-
-        # Use PEFT's wrapper-owned source-to-destination map without mutating the live
-        # model. The proxy supplies precisely the attributes used by 0.18.1's helper.
-        proxy = SimpleNamespace(
-            _adapters={adapter_name},
-            modules_to_save={adapter_name: storage_module},
+    destinations: dict[str, torch.Size] = {}
+    for name in target_names:
+        module = base_model.get_submodule(name)
+        assert isinstance(module, torch.nn.Linear)
+        prefix = f"base_model.model.{name}"
+        destinations[f"{prefix}.lora_A.{adapter_name}.weight"] = torch.Size(
+            (rank, module.in_features)
         )
-        key_map = ModulesToSaveWrapper.adapter_state_dict_load_map(proxy, adapter_name)
-        module_name = f"base_model.model.{name}"
-        for source_suffix, destination_suffix in key_map.items():
-            destinations[f"{module_name}.{source_suffix}"] = (
-                f"{module_name}.{destination_suffix}"
-            )
-
-    trainable_token_indices = getattr(peft_config, "trainable_token_indices", None)
-    if trainable_token_indices is not None:
-        if not isinstance(trainable_token_indices, dict):
-            from peft.utils.other import _get_input_embeddings_name
-
-            input_name = _get_input_embeddings_name(base_model, "embed_tokens")
-            trainable_token_indices = {input_name: trainable_token_indices}
-
-        token_proxy = SimpleNamespace(token_adapter=SimpleNamespace(tied_adapter=None))
-        key_map = TrainableTokensWrapper.adapter_state_dict_load_map(
-            token_proxy,
-            adapter_name,
+        destinations[f"{prefix}.lora_B.{adapter_name}.weight"] = torch.Size(
+            (module.out_features, rank)
         )
-        for target_name in trainable_token_indices:
-            matching_names = [
-                name
-                for name, _ in named_modules
-                if name and name.endswith(target_name)
-            ]
-            for name in matching_names:
-                module_name = f"base_model.model.{name}"
-                for source_suffix, destination_suffix in key_map.items():
-                    destinations[f"{module_name}.{source_suffix}"] = (
-                        f"{module_name}.{destination_suffix}"
-                    )
-
     return destinations
 
 
-def _shared_base_bias_names(model: torch.nn.Module) -> set[str]:
-    return {
-        _canonical_base_parameter_name(name)
-        for name, _ in _unwrapped_model(model).named_parameters()
-        if name.endswith(".bias")
-        and ".lora_" not in name
-        and ".modules_to_save." not in name
-    }
-
-
-def _expected_new_lora_destinations(
+def _expected_auxiliary_destinations(
     model: torch.nn.Module,
     peft_config: Any,
     *,
     adapter_name: str,
-    target_module_names: set[str],
-    target_parameter_names: set[str],
-) -> set[str]:
-    from peft.tuners.tuners_utils import BaseTunerLayer
+) -> dict[str, tuple[str, torch.Size]]:
+    from peft.utils.other import ModulesToSaveWrapper
+
+    if not peft_config.modules_to_save:
+        return {}
 
     base_model = _unwrapped_model(model)
-    target_modules: dict[str, torch.nn.Module] = {}
-    for name in target_module_names:
-        target_modules[name] = base_model.get_submodule(name)
-    for parameter_name in target_parameter_names:
-        module_name, _, _ = parameter_name.rpartition(".")
-        target_modules[module_name] = base_model.get_submodule(module_name)
-
-    destinations: set[str] = set()
-    for name, module in target_modules.items():
-        if isinstance(module, BaseTunerLayer):
-            module = module.get_base_layer()
-        prefix = f"base_model.model.{name}"
-        if isinstance(module, torch.nn.Embedding):
-            destinations.update(
-                {
-                    f"{prefix}.lora_embedding_A.{adapter_name}",
-                    f"{prefix}.lora_embedding_B.{adapter_name}",
-                }
+    module = base_model.get_submodule("duration_predictor")
+    proxy = SimpleNamespace(
+        _adapters={adapter_name},
+        modules_to_save={adapter_name: module},
+    )
+    key_map = ModulesToSaveWrapper.adapter_state_dict_load_map(proxy, adapter_name)
+    module_state = module.state_dict()
+    prefix = "base_model.model.duration_predictor"
+    destinations: dict[str, tuple[str, torch.Size]] = {}
+    for source_suffix, destination_suffix in key_map.items():
+        source_tensor = module_state.get(source_suffix)
+        if source_tensor is None:
+            raise RuntimeError(
+                "PEFT modules_to_save mapping referenced missing duration_predictor state "
+                f"{source_suffix!r}."
             )
-        else:
-            destinations.update(
-                {
-                    f"{prefix}.lora_A.{adapter_name}.weight",
-                    f"{prefix}.lora_B.{adapter_name}.weight",
-                }
-            )
-            if getattr(peft_config, "lora_bias", False):
-                destinations.update(
-                    {
-                        f"{prefix}.lora_A.{adapter_name}.bias",
-                        f"{prefix}.lora_B.{adapter_name}.bias",
-                    }
-                )
-        if getattr(peft_config, "use_dora", False):
-            destinations.add(f"{prefix}.lora_magnitude_vector.{adapter_name}.weight")
+        destinations[f"{prefix}.{source_suffix}"] = (
+            f"{prefix}.{destination_suffix}",
+            source_tensor.shape,
+        )
     return destinations
 
 
 def _peft_lora_payload_destination(key: str, *, adapter_name: str) -> str:
-    # Use PEFT 0.18.1's own adapter-name insertion instead of approximating its
-    # rpartition/replacement behavior. Mirror its legacy DoRA key normalization too.
     from peft.utils.save_and_load import _insert_adapter_name_into_state_dict
 
     transformed = _insert_adapter_name_into_state_dict(
@@ -638,11 +576,7 @@ def _peft_lora_payload_destination(key: str, *, adapter_name: str) -> str:
         adapter_name=adapter_name,
         parameter_prefix="lora_",
     )
-    destination = next(iter(transformed))
-    old_dora_suffix = f"lora_magnitude_vector.{adapter_name}"
-    if destination.endswith(old_dora_suffix):
-        destination += ".weight"
-    return destination
+    return next(iter(transformed))
 
 
 def _record_expected_state(
@@ -654,141 +588,168 @@ def _record_expected_state(
 ) -> None:
     if destination in expected_state:
         raise ValueError(
-            "Unsupported LoRA adapter state for dynamic runtime LoRA: multiple payload "
-            f"entries map to destination {destination!r} in {path}."
+            "Unsupported character LoRA adapter state: multiple payload entries map to "
+            f"destination {destination!r} in {path}."
         )
     expected_state[destination] = tensor.detach().clone()
 
 
-def _validate_lora_adapter_state(
+def _validate_character_lora_adapter_state(
     model: torch.nn.Module,
     path: str | Path,
     *,
-    bias: str,
-    target_names: set[str],
-    target_parameter_names: set[str],
     peft_config: Any,
     adapter_name: str,
-) -> tuple[tuple[str, torch.Tensor], ...]:
-    # This is PEFT's own local-file selection and deserialization path (safetensors first,
-    # then adapter_model.bin with weights_only=True), so the keys checked here are precisely
-    # the payload that set_peft_model_state_dict will receive.
+    target_names: set[str],
+) -> tuple[tuple[tuple[str, torch.Tensor], ...], tuple[tuple[str, torch.Tensor], ...]]:
     from peft.utils.save_and_load import load_peft_weights
 
     state = load_peft_weights(str(path), device="cpu")
     if not isinstance(state, Mapping):
         raise ValueError(f"LoRA adapter state must contain a tensor mapping: {path}")
 
-    auxiliary_destinations = _peft_auxiliary_payload_destinations(
+    lora_shapes = _expected_lora_destination_shapes(
+        model,
+        adapter_name=adapter_name,
+        target_names=target_names,
+        rank=int(peft_config.r),
+    )
+    auxiliary = _expected_auxiliary_destinations(
         model,
         peft_config,
         adapter_name=adapter_name,
     )
-    lora_destinations = _expected_new_lora_destinations(
-        model,
-        peft_config,
-        adapter_name=adapter_name,
-        target_module_names=target_names,
-        target_parameter_names=target_parameter_names,
-    )
-    shared_biases = _shared_base_bias_names(model)
+    required_shapes = dict(lora_shapes)
+    required_shapes.update(destination for destination in auxiliary.values())
+
     unsafe_keys: list[str] = []
     expected_state: dict[str, torch.Tensor] = {}
-    new_adapter_destinations = 0
+    validated_payload: dict[str, torch.Tensor] = {}
     for key, tensor in state.items():
-        if not isinstance(key, str):
+        if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
             unsafe_keys.append(repr(key))
             continue
-        if not isinstance(tensor, torch.Tensor):
+        if not tensor.is_floating_point():
             unsafe_keys.append(key)
             continue
 
-        # These are exact source keys returned by PEFT's auxiliary wrapper load maps.
-        # In particular, original_module and pre-existing adapter namespaces cannot
-        # pass merely because they are located beneath the same logical module.
-        if key in auxiliary_destinations:
-            _record_expected_state(
-                expected_state,
-                destination=auxiliary_destinations[key],
-                tensor=tensor,
-                path=path,
-            )
-            new_adapter_destinations += 1
-            continue
-
-        # Wrapper internals are never valid serialized source paths unless PEFT's
-        # exact load map above says otherwise. Check them before the LoRA prefix,
-        # since an attacker-controlled adapter namespace can itself contain "lora_".
-        if any(
+        auxiliary_destination = auxiliary.get(key)
+        if auxiliary_destination is not None:
+            destination, expected_shape = auxiliary_destination
+        elif any(
             marker in key
             for marker in (".original_module.", ".modules_to_save.", ".token_adapter.")
         ):
             unsafe_keys.append(key)
             continue
-
-        # PEFT inserts the runtime adapter name into every LoRA-prefixed state key.
-        if "lora_" in key:
+        elif "lora_" in key:
             destination = _peft_lora_payload_destination(key, adapter_name=adapter_name)
-            if destination not in lora_destinations:
+            expected_shape = lora_shapes.get(destination)
+            if expected_shape is None:
                 unsafe_keys.append(key)
                 continue
-            _record_expected_state(
-                expected_state,
-                destination=destination,
-                tensor=tensor,
-                path=path,
-            )
-            new_adapter_destinations += 1
+        else:
+            unsafe_keys.append(key)
             continue
 
-        canonical_key = _canonical_base_parameter_name(key)
-        if canonical_key.endswith(".bias") and canonical_key in shared_biases:
-            if bias == "all":
-                _record_expected_state(
-                    expected_state,
-                    destination=key,
-                    tensor=tensor,
-                    path=path,
-                )
-                continue
-            if bias == "lora_only" and canonical_key.removesuffix(".bias") in target_names:
-                _record_expected_state(
-                    expected_state,
-                    destination=key,
-                    tensor=tensor,
-                    path=path,
-                )
-                continue
-
-        # Every remaining key is passed through unchanged to model.load_state_dict(strict=False).
-        # If it matches, it writes shared state; if it does not, rejecting it is the fail-closed
-        # behavior required for an unrecognized dynamic adapter payload.
-        unsafe_keys.append(key)
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                "Unsupported character LoRA adapter state: shape mismatch for "
+                f"{key!r}; expected {tuple(expected_shape)}, got {tuple(tensor.shape)} ({path})."
+            )
+        _record_expected_state(
+            expected_state,
+            destination=destination,
+            tensor=tensor,
+            path=path,
+        )
+        validated_payload[key] = tensor.detach().clone()
 
     if unsafe_keys:
         sample = ", ".join(repr(key) for key in unsafe_keys[:3])
         if len(unsafe_keys) > 3:
             sample += f", ... ({len(unsafe_keys)} total)"
         raise ValueError(
-            "Unsupported LoRA adapter state for dynamic runtime LoRA: payload contains "
-            f"unrecognized shared-base writes or non-applicable adapter entries in {path}: "
-            f"{sample}."
+            "Unsupported character LoRA adapter state: payload contains unrecognized, "
+            f"shared-base, or invalid adapter entries in {path}: {sample}."
         )
-    if new_adapter_destinations == 0:
+
+    missing = sorted(set(required_shapes) - set(expected_state))
+    if missing:
+        sample = ", ".join(repr(key) for key in missing[:3])
+        if len(missing) > 3:
+            sample += f", ... ({len(missing)} total)"
         raise ValueError(
-            "Unsupported LoRA adapter state for dynamic runtime LoRA: no adapter-owned "
-            f"tensor in {path} has an actual destination for the new adapter."
+            "Incomplete character LoRA adapter state: missing required A/B or "
+            f"modules_to_save tensors in {path}: {sample}."
         )
-    return tuple(expected_state.items())
+    return tuple(validated_payload.items()), tuple(expected_state.items())
+
+
+def apply_preflighted_lora_adapter(
+    model: torch.nn.Module,
+    preflight: LoraAdapterPreflight,
+) -> torch.nn.Module:
+    """Inject and load the exact config and payload already accepted by preflight."""
+    _, peft_model_cls, get_peft_model = _require_peft()
+    if isinstance(model, peft_model_cls) or getattr(model, "peft_config", None):
+        raise RuntimeError("Character runtime model already contains a PEFT adapter.")
+
+    peft_model = get_peft_model(
+        model,
+        preflight.peft_config,
+        adapter_name=preflight.adapter_name,
+    )
+    from peft.utils.save_and_load import set_peft_model_state_dict
+
+    set_peft_model_state_dict(
+        peft_model,
+        dict(preflight.adapter_state),
+        adapter_name=preflight.adapter_name,
+    )
+    peft_model.set_adapter(preflight.adapter_name)
+    return peft_model
 
 
 def validate_lora_adapter_applied_state(
     model: torch.nn.Module,
     preflight: LoraAdapterPreflight,
 ) -> None:
-    """Prove every accepted payload tensor reached its exact post-load destination."""
-    actual_state = model.state_dict()
+    """Verify complete values and immutable single-adapter inference state."""
+    _, peft_model_cls, _ = _require_peft()
     failures: list[str] = []
+    if not isinstance(model, peft_model_cls):
+        failures.append("model is not a PEFT model")
+
+    configs = getattr(model, "peft_config", {})
+    if set(configs) != {preflight.adapter_name}:
+        failures.append(f"loaded adapter set is {sorted(configs)!r}")
+    else:
+        config = configs[preflight.adapter_name]
+        if not bool(getattr(config, "inference_mode", False)):
+            failures.append("adapter is not configured for inference")
+
+    active = getattr(model, "active_adapters", [])
+    if callable(active):
+        active = active()
+    if isinstance(active, str):
+        active = [active]
+    if list(active) != [preflight.adapter_name]:
+        failures.append(f"active adapters are {list(active)!r}")
+
+    from peft.tuners.tuners_utils import BaseTunerLayer
+    from peft.utils.other import ModulesToSaveWrapper
+
+    for module in model.modules():
+        if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
+            if bool(getattr(module, "merged", False)):
+                failures.append("an adapter layer is merged")
+            if bool(getattr(module, "disable_adapters", False)):
+                failures.append("an adapter layer is disabled")
+    if model.training:
+        failures.append("model is not in eval mode")
+
+    actual_state = model.state_dict()
     for destination, expected in preflight.expected_applied_state:
         actual = actual_state.get(destination)
         if actual is None:
@@ -808,65 +769,34 @@ def validate_lora_adapter_applied_state(
         sample = "; ".join(failures[:3])
         if len(failures) > 3:
             sample += f"; ... ({len(failures)} total)"
-        raise RuntimeError(
-            "Dynamic LoRA adapter load did not apply every preflight-accepted tensor: "
-            f"{sample}."
-        )
+        raise RuntimeError(f"Character LoRA post-load verification failed: {sample}.")
 
 
 def preflight_lora_adapter(
     model: torch.nn.Module,
     path: str | Path,
     *,
-    adapter_name: str = "default",
+    adapter_name: str = "character",
 ) -> LoraAdapterPreflight:
-    """Validate config, load payload, ranks, and loaded-adapter conflicts without mutation."""
-    config_path, payload, bias = _validated_lora_adapter_config(path)
-    lora_config_cls, _, _ = _require_peft()
-    peft_config = lora_config_cls.from_pretrained(str(path))
-
-    target_names = _peft_target_module_names(model, peft_config)
-    if payload.get("init_lora_weights", True) == "orthogonal":
-        target_names = _validate_orthogonal_ranks(
-            model,
-            peft_config,
-            config_path=config_path,
-        )
-
-    loaded_configs = getattr(model, "peft_config", {})
-    target_parameter_names = _validate_wrapper_topology(
+    """Validate the complete supported first/only character adapter without mutation."""
+    config_path = Path(path) / LORA_ADAPTER_CONFIG_NAME
+    peft_config = _validated_character_lora_adapter_config(path)
+    target_names = _validate_character_target_modules(
         model,
         peft_config,
-        loaded_configs=loaded_configs,
+        config_path=config_path,
     )
-    if bias != "none" and any(
-        getattr(config, "bias", "none") != "none" for config in loaded_configs.values()
-    ):
-        raise ValueError(
-            "Unsupported LoRA adapter combination for dynamic runtime LoRA: PEFT supports "
-            "only one loaded adapter with bias != 'none'."
-        )
-
-    expected_applied_state = _validate_lora_adapter_state(
+    adapter_state, expected_applied_state = _validate_character_lora_adapter_state(
         model,
         path,
-        bias=bias,
-        target_names=target_names,
-        target_parameter_names=target_parameter_names,
         peft_config=peft_config,
         adapter_name=adapter_name,
+        target_names=target_names,
     )
-    # PEFT's state loader queries every existing TrainableTokensWrapper for the new
-    # adapter. For an ordinary LoRA this raises a KeyError after adapter injection;
-    # fail before mutation, but only after payload validation has had a chance to
-    # reject cross-adapter trainable-token namespace spoofing precisely.
-    if _has_trainable_tokens_wrapper(model):
-        raise ValueError(
-            "Unsupported LoRA adapter combination for dynamic runtime LoRA: an existing "
-            "TrainableTokensWrapper cannot safely accept another adapter in PEFT 0.18.1."
-        )
     return LoraAdapterPreflight(
-        bias=bias,
+        adapter_name=adapter_name,
+        peft_config=peft_config,
+        adapter_state=adapter_state,
         expected_applied_state=expected_applied_state,
     )
 
@@ -879,6 +809,7 @@ def load_lora_adapter(
     adapter_name: str = "default",
     torch_device: str | None = None,
 ) -> torch.nn.Module:
+    """Broader PEFT loader retained for training, resume, and checkpoint conversion."""
     _, peft_model_cls, _ = _require_peft()
     if isinstance(model, peft_model_cls):
         if adapter_name not in model.peft_config:
