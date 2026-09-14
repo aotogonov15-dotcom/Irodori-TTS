@@ -203,6 +203,22 @@ class RuntimeLifecycle(str, Enum):
     CLOSED = "closed"
 
 
+class _RuntimeCacheOwnership(str, Enum):
+    PRIVATE = "private"
+    CACHED = "cached"
+    CHARACTER = "character"
+    EVICTING = "evicting"
+
+
+@dataclass(frozen=True)
+class RuntimePreloadInfo:
+    """Immutable metadata returned without exposing the cached runtime object."""
+
+    reloaded: bool
+    use_caption_condition: bool
+    use_speaker_condition: bool
+
+
 @dataclass(frozen=True)
 class _CharacterLoraRequest:
     explicit: bool
@@ -595,6 +611,7 @@ class InferenceRuntime:
         self._character_lora_adapter: str | None = None
         self._character_adapter_name: str | None = None
         self._failure_reason: str | None = None
+        self._cache_ownership = _RuntimeCacheOwnership.PRIVATE
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -729,6 +746,7 @@ class InferenceRuntime:
     def finalize_character(self, lora_adapter: str | None = None) -> None:
         """Finalize this runtime for exactly one character, with zero or one LoRA."""
         request = self._parse_character_lora_request(lora_adapter)
+        _claim_runtime_for_character(self)
         with self._infer_lock:
             if self._lifecycle_state != RuntimeLifecycle.BASE_READY:
                 self._raise_for_unusable_state()
@@ -1058,6 +1076,7 @@ class InferenceRuntime:
             if log_fn is not None:
                 log_fn(message)
 
+        _claim_runtime_for_character(self)
         with (
             self._infer_lock,
             self._prepare_lora_for_request(
@@ -1306,6 +1325,7 @@ class InferenceRuntime:
             _log(f"[runtime] using seed: {used_seed}")
         post_load_t0 = _measure_start(self.model_device, self.codec_device)
 
+        _claim_runtime_for_character(self)
         with (
             self._infer_lock,
             self._prepare_lora_for_request(
@@ -1620,6 +1640,33 @@ _RUNTIME_CACHE_LOCK = threading.Lock()
 _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
 
+# Lock order: character entry points claim under _RUNTIME_CACHE_LOCK before taking
+# _infer_lock. Cache code never takes _infer_lock and unloads only after releasing the
+# cache lock. CharacterRuntimeSession may take its own lock first; cache code never calls it.
+
+
+def _runtime_cache_ownership(runtime: InferenceRuntime) -> _RuntimeCacheOwnership:
+    return getattr(runtime, "_cache_ownership", _RuntimeCacheOwnership.PRIVATE)
+
+
+def _claim_runtime_for_character(runtime: InferenceRuntime) -> None:
+    """Irreversibly reserve a runtime before any character-specific preflight."""
+    global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
+    with _RUNTIME_CACHE_LOCK:
+        ownership = _runtime_cache_ownership(runtime)
+        if ownership == _RuntimeCacheOwnership.CHARACTER:
+            return
+        if ownership == _RuntimeCacheOwnership.EVICTING:
+            raise RuntimeError("This inference runtime is reserved for cache eviction.")
+        if ownership == _RuntimeCacheOwnership.CACHED:
+            if _RUNTIME_CACHE_VALUE is not runtime:
+                raise RuntimeError("Cached runtime ownership was lost before character claim.")
+            if runtime.lifecycle_state != RuntimeLifecycle.BASE_READY:
+                raise RuntimeError("Only a pristine BASE_READY runtime can be claimed.")
+            _RUNTIME_CACHE_KEY = None
+            _RUNTIME_CACHE_VALUE = None
+        runtime._cache_ownership = _RuntimeCacheOwnership.CHARACTER
+
 
 def _detach_cached_runtime(runtime: InferenceRuntime) -> None:
     """Remove a claimed/terminal runtime from the pristine-base cache."""
@@ -1628,30 +1675,95 @@ def _detach_cached_runtime(runtime: InferenceRuntime) -> None:
         if _RUNTIME_CACHE_VALUE is runtime:
             _RUNTIME_CACHE_KEY = None
             _RUNTIME_CACHE_VALUE = None
+            if _runtime_cache_ownership(runtime) == _RuntimeCacheOwnership.CACHED:
+                runtime._cache_ownership = _RuntimeCacheOwnership.EVICTING
 
 
-def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
+def _preload_info(runtime: InferenceRuntime, *, reloaded: bool) -> RuntimePreloadInfo:
+    return RuntimePreloadInfo(
+        reloaded=reloaded,
+        use_caption_condition=bool(runtime.model_cfg.use_caption_condition),
+        use_speaker_condition=bool(runtime.model_cfg.use_speaker_condition_resolved),
+    )
+
+
+def preload_cached_runtime(key: RuntimeKey) -> RuntimePreloadInfo:
+    """Load or reuse a pristine base without exposing a mutable runtime alias."""
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
+    evicted_runtime: InferenceRuntime | None = None
     with _RUNTIME_CACHE_LOCK:
         if (
             _RUNTIME_CACHE_VALUE is not None
             and _RUNTIME_CACHE_KEY == key
+            and _runtime_cache_ownership(_RUNTIME_CACHE_VALUE)
+            == _RuntimeCacheOwnership.CACHED
             and _RUNTIME_CACHE_VALUE.lifecycle_state == RuntimeLifecycle.BASE_READY
         ):
-            return _RUNTIME_CACHE_VALUE, False
+            return _preload_info(_RUNTIME_CACHE_VALUE, reloaded=False)
 
         old_runtime = _RUNTIME_CACHE_VALUE
         runtime = InferenceRuntime.from_key(key)
+        if runtime.lifecycle_state != RuntimeLifecycle.BASE_READY:
+            raise RuntimeError("A newly loaded cache runtime must be BASE_READY.")
+        runtime._cache_ownership = _RuntimeCacheOwnership.CACHED
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
+        if (
+            old_runtime is not None
+            and _runtime_cache_ownership(old_runtime) == _RuntimeCacheOwnership.CACHED
+            and old_runtime.lifecycle_state == RuntimeLifecycle.BASE_READY
+        ):
+            old_runtime._cache_ownership = _RuntimeCacheOwnership.EVICTING
+            evicted_runtime = old_runtime
 
-    if (
-        old_runtime is not None
-        and old_runtime.lifecycle_state == RuntimeLifecycle.BASE_READY
-    ):
-        old_runtime.unload()
+    if evicted_runtime is not None:
+        evicted_runtime.unload()
+
+    return _preload_info(runtime, reloaded=True)
+
+
+def claim_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
+    """Atomically take exclusive character-session ownership of a pristine runtime."""
+    global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
+    evicted_runtime: InferenceRuntime | None = None
+    with _RUNTIME_CACHE_LOCK:
+        if (
+            _RUNTIME_CACHE_VALUE is not None
+            and _RUNTIME_CACHE_KEY == key
+            and _runtime_cache_ownership(_RUNTIME_CACHE_VALUE)
+            == _RuntimeCacheOwnership.CACHED
+            and _RUNTIME_CACHE_VALUE.lifecycle_state == RuntimeLifecycle.BASE_READY
+        ):
+            runtime = _RUNTIME_CACHE_VALUE
+            runtime._cache_ownership = _RuntimeCacheOwnership.CHARACTER
+            _RUNTIME_CACHE_KEY = None
+            _RUNTIME_CACHE_VALUE = None
+            return runtime, False
+
+        old_runtime = _RUNTIME_CACHE_VALUE
+        runtime = InferenceRuntime.from_key(key)
+        if runtime.lifecycle_state != RuntimeLifecycle.BASE_READY:
+            raise RuntimeError("A newly loaded character runtime must be BASE_READY.")
+        runtime._cache_ownership = _RuntimeCacheOwnership.CHARACTER
+        _RUNTIME_CACHE_KEY = None
+        _RUNTIME_CACHE_VALUE = None
+        if (
+            old_runtime is not None
+            and _runtime_cache_ownership(old_runtime) == _RuntimeCacheOwnership.CACHED
+            and old_runtime.lifecycle_state == RuntimeLifecycle.BASE_READY
+        ):
+            old_runtime._cache_ownership = _RuntimeCacheOwnership.EVICTING
+            evicted_runtime = old_runtime
+
+    if evicted_runtime is not None:
+        evicted_runtime.unload()
 
     return runtime, True
+
+
+def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
+    """Compatibility alias for the exclusive character-runtime claim operation."""
+    return claim_cached_runtime(key)
 
 
 def clear_cached_runtime() -> None:
@@ -1660,9 +1772,68 @@ def clear_cached_runtime() -> None:
         runtime = _RUNTIME_CACHE_VALUE
         _RUNTIME_CACHE_KEY = None
         _RUNTIME_CACHE_VALUE = None
+        if (
+            runtime is not None
+            and _runtime_cache_ownership(runtime) == _RuntimeCacheOwnership.CACHED
+            and runtime.lifecycle_state == RuntimeLifecycle.BASE_READY
+        ):
+            runtime._cache_ownership = _RuntimeCacheOwnership.EVICTING
+        else:
+            runtime = None
 
     if runtime is not None:
         runtime.unload()
+
+
+@dataclass(frozen=True)
+class _CharacterRuntimeSpec:
+    runtime_key: RuntimeKey
+    lora_adapter: str | None
+
+
+class CharacterRuntimeSession:
+    """Own one claimed runtime for one local character configuration."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._runtime: InferenceRuntime | None = None
+        self._spec: _CharacterRuntimeSpec | None = None
+
+    def acquire(
+        self,
+        key: RuntimeKey,
+        *,
+        lora_adapter: str | None,
+    ) -> tuple[InferenceRuntime, bool]:
+        request = InferenceRuntime._parse_character_lora_request(lora_adapter)
+        spec = _CharacterRuntimeSpec(key, request.adapter_path)
+        with self._lock:
+            if (
+                self._runtime is not None
+                and self._spec == spec
+                and self._runtime.lifecycle_state
+                not in {RuntimeLifecycle.FAILED, RuntimeLifecycle.CLOSED}
+            ):
+                return self._runtime, False
+
+            old_runtime = self._runtime
+            self._runtime = None
+            self._spec = None
+            if old_runtime is not None:
+                old_runtime.unload()
+
+            runtime, reloaded = claim_cached_runtime(key)
+            self._runtime = runtime
+            self._spec = spec
+            return runtime, reloaded
+
+    def close(self) -> None:
+        with self._lock:
+            runtime = self._runtime
+            self._runtime = None
+            self._spec = None
+            if runtime is not None:
+                runtime.unload()
 
 
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:

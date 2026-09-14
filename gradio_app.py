@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 from datetime import datetime
 from pathlib import Path
 
@@ -10,19 +11,21 @@ from huggingface_hub import hf_hub_download
 
 from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 from irodori_tts.inference_runtime import (
+    CharacterRuntimeSession,
     RuntimeKey,
     SamplingRequest,
     clear_cached_runtime,
     default_runtime_device,
-    get_cached_runtime,
     list_available_runtime_devices,
     list_available_runtime_precisions,
+    preload_cached_runtime,
     save_wav,
 )
 from irodori_tts.speaker_inversion import is_speaker_inversion_safetensors_path
 
 MAX_GRADIO_CANDIDATES = 32
 GRADIO_AUDIO_COLS_PER_ROW = 8
+_RUNTIME_SESSION = CharacterRuntimeSession()
 
 
 def _default_checkpoint() -> str:
@@ -193,8 +196,8 @@ def _load_model(
         codec_device=codec_device,
         codec_precision=codec_precision,
     )
-    _, reloaded = get_cached_runtime(runtime_key)
-    if reloaded:
+    preload = preload_cached_runtime(runtime_key)
+    if preload.reloaded:
         status = "loaded model into memory"
     else:
         status = "model already loaded; reused existing runtime"
@@ -281,7 +284,10 @@ def _run_generation(
     ref_normalize_db = -16.0
     ref_ensure_max = True
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
+    runtime, reloaded = _RUNTIME_SESSION.acquire(
+        runtime_key,
+        lora_adapter=lora_adapter,
+    )
     stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
     stdout_log(
         (
@@ -378,8 +384,16 @@ def _run_generation(
 
 
 def _clear_runtime_cache() -> str:
-    clear_cached_runtime()
+    _shutdown_runtimes()
     return "cleared loaded model from memory"
+
+
+def _shutdown_runtimes() -> None:
+    _RUNTIME_SESSION.close()
+    clear_cached_runtime()
+
+
+atexit.register(_shutdown_runtimes)
 
 
 def build_ui() -> gr.Blocks:
@@ -630,13 +644,16 @@ def main() -> None:
 
     demo = build_ui()
     demo.queue(default_concurrency_limit=1)
-    demo.launch(
-        server_name=args.server_name,
-        server_port=args.server_port,
-        share=bool(args.share),
-        debug=bool(args.debug),
-        css=EMOJI_PALETTE_CSS,
-    )
+    try:
+        demo.launch(
+            server_name=args.server_name,
+            server_port=args.server_port,
+            share=bool(args.share),
+            debug=bool(args.debug),
+            css=EMOJI_PALETTE_CSS,
+        )
+    finally:
+        _shutdown_runtimes()
 
 
 if __name__ == "__main__":

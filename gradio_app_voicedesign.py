@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 from datetime import datetime
 from pathlib import Path
 
@@ -10,19 +11,21 @@ from huggingface_hub import hf_hub_download
 
 from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 from irodori_tts.inference_runtime import (
+    CharacterRuntimeSession,
     RuntimeKey,
     SamplingRequest,
     clear_cached_runtime,
     default_runtime_device,
-    get_cached_runtime,
     list_available_runtime_devices,
     list_available_runtime_precisions,
+    preload_cached_runtime,
     save_wav,
 )
 from irodori_tts.speaker_inversion import is_speaker_inversion_safetensors_path
 
 MAX_GRADIO_CANDIDATES = 32
 GRADIO_AUDIO_COLS_PER_ROW = 8
+_RUNTIME_SESSION = CharacterRuntimeSession()
 
 
 def _default_checkpoint() -> str:
@@ -170,16 +173,18 @@ def _describe_runtime(
         codec_device=codec_device,
         codec_precision=codec_precision,
     )
-    runtime, reloaded = get_cached_runtime(runtime_key)
+    preload = preload_cached_runtime(runtime_key)
     status = (
-        "loaded model into memory" if reloaded else "model already loaded; reused existing runtime"
+        "loaded model into memory"
+        if preload.reloaded
+        else "model already loaded; reused existing runtime"
     )
     notes: list[str] = []
-    if not runtime.model_cfg.use_caption_condition:
+    if not preload.use_caption_condition:
         notes.append(
             "warning: this checkpoint does not enable caption conditioning. Use gradio_app.py for reference-audio inference."
         )
-    if runtime.model_cfg.use_speaker_condition_resolved:
+    if preload.use_speaker_condition:
         notes.append(
             "info: this checkpoint supports speaker conditioning; provide reference audio or keep no-reference enabled."
         )
@@ -191,8 +196,8 @@ def _describe_runtime(
             f"model_precision: {runtime_key.model_precision}",
             f"codec_device: {runtime_key.codec_device}",
             f"codec_precision: {runtime_key.codec_precision}",
-            f"use_caption_condition: {runtime.model_cfg.use_caption_condition}",
-            f"use_speaker_condition: {runtime.model_cfg.use_speaker_condition_resolved}",
+            f"use_caption_condition: {preload.use_caption_condition}",
+            f"use_speaker_condition: {preload.use_speaker_condition}",
             *notes,
         ]
     )
@@ -264,7 +269,10 @@ def _run_generation(
     manual_seconds = _parse_optional_float(seconds_raw, "seconds")
     lora_adapter = _parse_optional_str(lora_adapter_raw)
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
+    runtime, reloaded = _RUNTIME_SESSION.acquire(
+        runtime_key,
+        lora_adapter=lora_adapter,
+    )
     if not runtime.model_cfg.use_caption_condition:
         raise ValueError(
             "Loaded checkpoint does not enable caption conditioning. Use gradio_app.py for the original reference-audio model."
@@ -376,8 +384,16 @@ def _run_generation(
 
 
 def _clear_runtime_cache() -> str:
-    clear_cached_runtime()
+    _shutdown_runtimes()
     return "cleared loaded model from memory"
+
+
+def _shutdown_runtimes() -> None:
+    _RUNTIME_SESSION.close()
+    clear_cached_runtime()
+
+
+atexit.register(_shutdown_runtimes)
 
 
 def build_ui() -> gr.Blocks:
@@ -624,13 +640,16 @@ def main() -> None:
 
     demo = build_ui()
     demo.queue(default_concurrency_limit=1)
-    demo.launch(
-        server_name=args.server_name,
-        server_port=args.server_port,
-        share=bool(args.share),
-        debug=bool(args.debug),
-        css=EMOJI_PALETTE_CSS,
-    )
+    try:
+        demo.launch(
+            server_name=args.server_name,
+            server_port=args.server_port,
+            share=bool(args.share),
+            debug=bool(args.debug),
+            css=EMOJI_PALETTE_CSS,
+        )
+    finally:
+        _shutdown_runtimes()
 
 
 if __name__ == "__main__":

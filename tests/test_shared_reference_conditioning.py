@@ -17,13 +17,15 @@ from safetensors.torch import save_file as save_safetensors_file
 
 from irodori_tts.config import ModelConfig
 from irodori_tts.inference_runtime import (
+    CharacterRuntimeSession,
     InferenceRuntime,
     PreparedReferenceConditioning,
     RuntimeKey,
     RuntimeLifecycle,
     SamplingRequest,
+    claim_cached_runtime,
     clear_cached_runtime,
-    get_cached_runtime,
+    preload_cached_runtime,
 )
 from irodori_tts.model import TextToLatentRFDiT, patch_sequence_with_mask
 from irodori_tts.rf import sample_euler_rf_cfg
@@ -995,6 +997,17 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
         replacement.rename(state_path)
         return destination
 
+    @classmethod
+    def _clone_state_bin(cls, source: Path, name: str, transform) -> Path:
+        destination = Path(cls.temp_dir.name) / name
+        shutil.copytree(source, destination)
+        state_path = destination / "adapter_model.safetensors"
+        loaded = load_safetensors_file(state_path, device="cpu")
+        state = {key: value.clone() for key, value in loaded.items()}
+        state_path.unlink()
+        torch.save(transform(state), destination / "adapter_model.bin")
+        return destination
+
     def _runtime(self) -> InferenceRuntime:
         return _make_real_runtime(cfg=self.cfg, state_dict=self.base_state)
 
@@ -1302,6 +1315,96 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
         loader.assert_not_called()
         self.assertEqual(runtime.lifecycle_state, RuntimeLifecycle.BASE_READY)
 
+    def test_sparse_lora_layouts_reject_before_mutation(self) -> None:
+        def replace_lora_a(state, layout):
+            key = next(key for key in state if ".lora_A." in key)
+            state[key] = layout(state[key])
+            return state
+
+        cases = {
+            "sparse-coo": lambda tensor: tensor.to_sparse(),
+            "sparse-csr": lambda tensor: tensor.to_sparse_csr(),
+        }
+        for name, layout in cases.items():
+            with self.subTest(name=name):
+                adapter = self._clone_state_bin(
+                    self.adapter_a,
+                    name,
+                    lambda state, layout=layout: replace_lora_a(state, layout),
+                )
+                runtime = self._runtime()
+                model_before = runtime.model
+                with patch(
+                    "irodori_tts.inference_runtime.apply_preflighted_lora_adapter",
+                    side_effect=AssertionError("sparse payload must not mutate"),
+                ) as loader:
+                    with self.assertRaisesRegex(ValueError, "tensor layout"):
+                        runtime.finalize_character(str(adapter))
+
+                loader.assert_not_called()
+                self.assertEqual(runtime.lifecycle_state, RuntimeLifecycle.BASE_READY)
+                self.assertIs(runtime.model, model_before)
+
+    def test_sparse_duration_predictor_layout_rejects_before_mutation(self) -> None:
+        def make_auxiliary_sparse(state):
+            key = next(
+                key
+                for key in state
+                if ".duration_predictor." in key and "lora_" not in key
+            )
+            state[key] = state[key].to_sparse()
+            return state
+
+        adapter = self._clone_state_bin(
+            self.adapter_duration,
+            "sparse-duration-predictor",
+            make_auxiliary_sparse,
+        )
+        runtime = self._runtime()
+        model_before = runtime.model
+        with patch(
+            "irodori_tts.inference_runtime.apply_preflighted_lora_adapter",
+            side_effect=AssertionError("sparse auxiliary payload must not mutate"),
+        ) as loader:
+            with self.assertRaisesRegex(ValueError, "tensor layout"):
+                runtime.finalize_character(str(adapter))
+
+        loader.assert_not_called()
+        self.assertIs(runtime.model, model_before)
+        self.assertEqual(runtime.lifecycle_state, RuntimeLifecycle.BASE_READY)
+
+    def test_sparse_layout_rejection_keeps_runtime_exclusive_to_claiming_session(
+        self,
+    ) -> None:
+        def make_lora_a_sparse(state):
+            key = next(key for key in state if ".lora_A." in key)
+            state[key] = state[key].to_sparse()
+            return state
+
+        adapter = self._clone_state_bin(
+            self.adapter_a,
+            "sparse-claimed-runtime",
+            make_lora_a_sparse,
+        )
+        key = RuntimeKey(checkpoint="sparse-claim", model_device="cpu")
+        claimed = self._runtime()
+        next_pristine = self._runtime()
+        clear_cached_runtime()
+        with patch.object(InferenceRuntime, "from_key", side_effect=[claimed, next_pristine]):
+            preload_cached_runtime(key)
+            claimed_runtime, reused_preload = claim_cached_runtime(key)
+            with self.assertRaisesRegex(ValueError, "tensor layout"):
+                claimed_runtime.finalize_character(str(adapter))
+            next_preload = preload_cached_runtime(key)
+
+        self.assertFalse(reused_preload)
+        self.assertTrue(next_preload.reloaded)
+        self.assertEqual(claimed.lifecycle_state, RuntimeLifecycle.BASE_READY)
+        self.assertEqual(next_pristine.lifecycle_state, RuntimeLifecycle.BASE_READY)
+        clear_cached_runtime()
+        self.assertEqual(claimed.lifecycle_state, RuntimeLifecycle.BASE_READY)
+        self.assertEqual(next_pristine.lifecycle_state, RuntimeLifecycle.CLOSED)
+
     def test_supported_ordinary_and_duration_predictor_adapters_load(self) -> None:
         for adapter in (self.adapter_a, self.adapter_duration):
             with self.subTest(adapter=adapter.name):
@@ -1388,32 +1491,36 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "runtime-owner mismatch"):
             self._synthesize_prepared(runtime_b, prepared, self.adapter_a)
 
-    def test_locked_runtime_is_detached_from_pristine_global_cache(self) -> None:
+    def test_preload_then_claim_detaches_runtime_from_pristine_cache(self) -> None:
         clear_cached_runtime()
         key = RuntimeKey(checkpoint="test", model_device="cpu")
         first = _make_runtime()
         second = _make_runtime()
         with patch.object(InferenceRuntime, "from_key", side_effect=[first, second]):
-            cached_first, created_first = get_cached_runtime(key)
-            cached_first.finalize_character()
-            cached_second, created_second = get_cached_runtime(key)
+            preload = preload_cached_runtime(key)
+            claimed_first, created_first = claim_cached_runtime(key)
+            claimed_first.finalize_character()
+            claimed_second, created_second = claim_cached_runtime(key)
 
-        self.assertTrue(created_first)
+        self.assertTrue(preload.reloaded)
+        self.assertFalse(created_first)
         self.assertTrue(created_second)
-        self.assertIs(cached_first, first)
-        self.assertIs(cached_second, second)
-        self.assertIsNot(cached_second, cached_first)
+        self.assertIs(claimed_first, first)
+        self.assertIs(claimed_second, second)
+        self.assertIsNot(claimed_second, claimed_first)
         clear_cached_runtime()
 
-    def test_failed_and_closed_runtimes_are_not_reused_from_global_cache(self) -> None:
-        for terminal in ("failed", "closed"):
+    def test_locked_failed_and_closed_runtimes_are_not_pristine_cache_hits(self) -> None:
+        for terminal in ("locked", "failed", "closed"):
             with self.subTest(terminal=terminal):
                 clear_cached_runtime()
                 key = RuntimeKey(checkpoint=f"test-{terminal}", model_device="cpu")
                 first = self._runtime()
                 second = self._runtime()
                 with patch.object(InferenceRuntime, "from_key", side_effect=[first, second]):
-                    cached_first, _ = get_cached_runtime(key)
+                    preload_cached_runtime(key)
+                    claimed_first, reused_preload = claim_cached_runtime(key)
+                    self.assertFalse(reused_preload)
                     if terminal == "failed":
                         with (
                             patch(
@@ -1422,29 +1529,163 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
                             ),
                             self.assertRaises(RuntimeError),
                         ):
-                            cached_first.finalize_character(str(self.adapter_a))
+                            claimed_first.finalize_character(str(self.adapter_a))
+                    elif terminal == "locked":
+                        claimed_first.finalize_character()
                     else:
-                        cached_first.unload()
-                    cached_second, created_second = get_cached_runtime(key)
+                        claimed_first.unload()
+                    second_preload = preload_cached_runtime(key)
+                    claimed_second, created_second = claim_cached_runtime(key)
 
-                self.assertTrue(created_second)
-                self.assertIs(cached_second, second)
-                self.assertIsNot(cached_second, cached_first)
+                self.assertTrue(second_preload.reloaded)
+                self.assertFalse(created_second)
+                self.assertIs(claimed_second, second)
+                self.assertIsNot(claimed_second, claimed_first)
                 clear_cached_runtime()
 
-    def test_base_ready_global_cache_reuses_the_same_pristine_runtime(self) -> None:
+    def test_base_ready_preload_reuses_the_same_pristine_runtime(self) -> None:
         clear_cached_runtime()
         key = RuntimeKey(checkpoint="test-base", model_device="cpu")
         runtime = _make_runtime()
         with patch.object(InferenceRuntime, "from_key", return_value=runtime) as factory:
-            first, first_created = get_cached_runtime(key)
-            second, second_created = get_cached_runtime(key)
+            first = preload_cached_runtime(key)
+            second = preload_cached_runtime(key)
 
-        self.assertTrue(first_created)
-        self.assertFalse(second_created)
-        self.assertIs(first, second)
+        self.assertTrue(first.reloaded)
+        self.assertFalse(second.reloaded)
         factory.assert_called_once_with(key)
         clear_cached_runtime()
+
+    def test_two_concurrent_claims_never_receive_the_same_cached_runtime(self) -> None:
+        clear_cached_runtime()
+        key = RuntimeKey(checkpoint="test-concurrent-claim", model_device="cpu")
+        first = _make_runtime()
+        second = _make_runtime()
+        barrier = threading.Barrier(3)
+        results: list[tuple[InferenceRuntime, bool]] = []
+        errors: list[BaseException] = []
+
+        def claim() -> None:
+            try:
+                barrier.wait(timeout=5)
+                results.append(claim_cached_runtime(key))
+            except BaseException as exc:  # pragma: no cover - thread handoff
+                errors.append(exc)
+
+        with patch.object(InferenceRuntime, "from_key", side_effect=[first, second]) as factory:
+            preload_cached_runtime(key)
+            threads = [threading.Thread(target=claim) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=5)
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual({id(runtime) for runtime, _ in results}, {id(first), id(second)})
+        self.assertEqual(sorted(reloaded for _, reloaded in results), [False, True])
+        self.assertEqual(factory.call_count, 2)
+        clear_cached_runtime()
+
+    def test_claimed_runtime_survives_different_key_cache_pressure_during_finalize(
+        self,
+    ) -> None:
+        clear_cached_runtime()
+        key_a = RuntimeKey(checkpoint="test-claim-a", model_device="cpu")
+        key_b = RuntimeKey(checkpoint="test-claim-b", model_device="cpu")
+        claimed = self._runtime()
+        replacement = self._runtime()
+        load_started = threading.Event()
+        release_load = threading.Event()
+        errors: list[BaseException] = []
+        from irodori_tts.lora import apply_preflighted_lora_adapter
+
+        def slow_apply(model, preflight):
+            load_started.set()
+            if not release_load.wait(timeout=5):
+                raise TimeoutError("test did not release character load")
+            return apply_preflighted_lora_adapter(model, preflight)
+
+        def finalize() -> None:
+            try:
+                claimed.finalize_character(str(self.adapter_a))
+            except BaseException as exc:  # pragma: no cover - thread handoff
+                errors.append(exc)
+
+        with (
+            patch.object(InferenceRuntime, "from_key", side_effect=[claimed, replacement]),
+            patch.object(claimed, "unload", wraps=claimed.unload) as claimed_unload,
+            patch(
+                "irodori_tts.inference_runtime.apply_preflighted_lora_adapter",
+                side_effect=slow_apply,
+            ),
+        ):
+            preload_cached_runtime(key_a)
+            claimed_runtime, reused_preload = claim_cached_runtime(key_a)
+            self.assertIs(claimed_runtime, claimed)
+            self.assertFalse(reused_preload)
+            finalize_thread = threading.Thread(target=finalize)
+            finalize_thread.start()
+            self.assertTrue(load_started.wait(timeout=5))
+
+            pressure = preload_cached_runtime(key_b)
+            self.assertTrue(pressure.reloaded)
+            claimed_unload.assert_not_called()
+
+            release_load.set()
+            finalize_thread.join(timeout=5)
+
+        self.assertFalse(finalize_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(claimed.lifecycle_state, RuntimeLifecycle.CHARACTER_LOCKED)
+        claimed_unload.assert_not_called()
+        clear_cached_runtime()
+
+    def test_cache_eviction_closes_only_cache_owned_pristine_runtime(self) -> None:
+        clear_cached_runtime()
+        key_a = RuntimeKey(checkpoint="test-evict-a", model_device="cpu")
+        key_b = RuntimeKey(checkpoint="test-evict-b", model_device="cpu")
+        first = _make_runtime()
+        second = _make_runtime()
+        with patch.object(InferenceRuntime, "from_key", side_effect=[first, second]):
+            preload_cached_runtime(key_a)
+            preload_cached_runtime(key_b)
+
+        self.assertEqual(first.lifecycle_state, RuntimeLifecycle.CLOSED)
+        self.assertEqual(second.lifecycle_state, RuntimeLifecycle.BASE_READY)
+        claimed_second, reused_preload = claim_cached_runtime(key_b)
+        self.assertIs(claimed_second, second)
+        self.assertFalse(reused_preload)
+        clear_cached_runtime()
+
+    def test_character_runtime_session_reuses_and_closes_on_replacement(self) -> None:
+        clear_cached_runtime()
+        key = RuntimeKey(checkpoint="test-session", model_device="cpu")
+        first = _make_runtime()
+        second = _make_runtime()
+        session = CharacterRuntimeSession()
+        with patch(
+            "irodori_tts.inference_runtime.claim_cached_runtime",
+            side_effect=[(first, True), (second, True)],
+        ) as claim:
+            acquired_first, first_reloaded = session.acquire(key, lora_adapter=None)
+            acquired_again, second_reloaded = session.acquire(key, lora_adapter=None)
+            acquired_replacement, replacement_reloaded = session.acquire(
+                key,
+                lora_adapter="different-character",
+            )
+
+        self.assertIs(acquired_first, first)
+        self.assertIs(acquired_again, first)
+        self.assertIs(acquired_replacement, second)
+        self.assertTrue(first_reloaded)
+        self.assertFalse(second_reloaded)
+        self.assertTrue(replacement_reloaded)
+        self.assertEqual(claim.call_count, 2)
+        self.assertEqual(first.lifecycle_state, RuntimeLifecycle.CLOSED)
+        session.close()
+        self.assertEqual(second.lifecycle_state, RuntimeLifecycle.CLOSED)
 
     def test_ref_embed_preparation_bypasses_speaker_encoder(self) -> None:
         runtime = self._runtime()

@@ -629,6 +629,11 @@ def _validate_character_lora_adapter_state(
         if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
             unsafe_keys.append(repr(key))
             continue
+        if tensor.layout != torch.strided:
+            raise ValueError(
+                "Unsupported character LoRA adapter state: tensor layout for "
+                f"{key!r} must be torch.strided, got {tensor.layout} ({path})."
+            )
         if not tensor.is_floating_point():
             unsafe_keys.append(key)
             continue
