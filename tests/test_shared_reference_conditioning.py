@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import secrets
 import shutil
 import tempfile
 import threading
@@ -204,9 +205,9 @@ def _legacy_speaker_condition_oracle(
     state = model.speaker_encoder(patched, patched_mask)
     state = model.speaker_norm(state)
     mask_f = patched_mask.unsqueeze(-1).to(dtype=state.dtype)
-    mean = (state * mask_f).sum(dim=1, keepdim=True) / mask_f.sum(
-        dim=1, keepdim=True
-    ).clamp_min(1.0)
+    mean = (state * mask_f).sum(dim=1, keepdim=True) / mask_f.sum(dim=1, keepdim=True).clamp_min(
+        1.0
+    )
     has_any = patched_mask.any(dim=1, keepdim=True)
     return torch.cat([mean, state], dim=1), torch.cat([has_any, patched_mask], dim=1)
 
@@ -243,6 +244,7 @@ def _make_runtime() -> InferenceRuntime:
     runtime._model_dtype = torch.float32
     runtime._lifecycle_state = RuntimeLifecycle.BASE_READY
     runtime._runtime_owner_token = object()
+    runtime._runtime_generation = secrets.token_hex(16)
     runtime._character_lora_adapter = None
     runtime._character_adapter_name = None
     runtime._failure_reason = None
@@ -278,6 +280,7 @@ def _make_real_runtime(
     runtime._model_dtype = torch.float32
     runtime._lifecycle_state = RuntimeLifecycle.BASE_READY
     runtime._runtime_owner_token = object()
+    runtime._runtime_generation = secrets.token_hex(16)
     runtime._character_lora_adapter = None
     runtime._character_adapter_name = None
     runtime._failure_reason = None
@@ -494,9 +497,7 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
 
     def test_real_duration_and_rf_kv_paths_preserve_prepared_tensors_and_equivalence(self) -> None:
         torch.manual_seed(23)
-        model = TextToLatentRFDiT(
-            _small_model_config(use_duration_predictor=True)
-        ).eval()
+        model = TextToLatentRFDiT(_small_model_config(use_duration_predictor=True)).eval()
         torch.nn.init.normal_(model.out_proj.weight, std=0.02)
         ref_latent = torch.randn((1, 6, 2))
         ref_mask = torch.tensor([[True, True, True, True, True, False]])
@@ -585,9 +586,7 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
 
     def test_real_cfg_off_no_ref_duration_and_sampling_match_prepared_strictly(self) -> None:
         torch.manual_seed(67)
-        model = TextToLatentRFDiT(
-            _small_model_config(use_duration_predictor=True)
-        ).eval()
+        model = TextToLatentRFDiT(_small_model_config(use_duration_predictor=True)).eval()
         torch.nn.init.normal_(model.out_proj.weight, std=0.02)
         no_ref_latent = torch.zeros((1, 1, 2))
         no_ref_mask = torch.zeros((1, 1), dtype=torch.bool)
@@ -666,9 +665,7 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
             strict=True,
         ):
             if prepared_tensor is not None:
-                torch.testing.assert_close(
-                    prepared_tensor, ordinary_tensor, rtol=0, atol=0
-                )
+                torch.testing.assert_close(prepared_tensor, ordinary_tensor, rtol=0, atol=0)
         torch.testing.assert_close(prepared_duration, ordinary_duration, rtol=0, atol=0)
         torch.testing.assert_close(prepared_sample, ordinary_sample, rtol=0, atol=0)
 
@@ -705,6 +702,27 @@ class PreparedReferenceConditioningTest(unittest.TestCase):
 
 
 class InferenceRuntimeSharedConditioningTest(unittest.TestCase):
+    def test_bytes_snapshot_is_the_reference_source_used_for_prepare(self) -> None:
+        runtime = _make_runtime()
+        snapshot = b"exact immutable input"
+
+        with (
+            patch(
+                "irodori_tts.inference_runtime._load_audio_bytes",
+                return_value=(torch.zeros((1, 8)), 4),
+            ) as load_bytes,
+            patch(
+                "irodori_tts.inference_runtime._load_audio",
+                side_effect=AssertionError("path loader must not run"),
+            ),
+        ):
+            runtime.prepare_reference_conditioning(
+                ref_wav_bytes=snapshot,
+                ref_normalize_db=None,
+            )
+
+        load_bytes.assert_called_once_with(snapshot)
+
     def test_wav_path_prepares_once_and_reuses_same_state_for_duration_and_sampling(self) -> None:
         runtime = _make_runtime()
         request = SamplingRequest(
@@ -766,12 +784,23 @@ class InferenceRuntimeSharedConditioningTest(unittest.TestCase):
             patch("irodori_tts.inference_runtime.sample_euler_rf_cfg", _fake_sampler),
         ):
             result = runtime.synthesize(request, prepared_reference=prepared)
+            repeated_result = runtime.synthesize(
+                SamplingRequest(
+                    text="prepared override repeated",
+                    num_candidates=2,
+                    num_steps=1,
+                    seed=9876,
+                    trim_tail=False,
+                ),
+                prepared_reference=prepared,
+            )
 
         self.assertEqual(runtime.codec.encode_count, 1)
         self.assertEqual(runtime.model.speaker_encode_count, 1)
         torch.testing.assert_close(prepared.speaker_state, original_state)
         torch.testing.assert_close(prepared.speaker_mask, original_mask)
         self.assertEqual(result.used_seed, 4321)
+        self.assertEqual(repeated_result.used_seed, 9876)
 
     def test_prepared_no_ref_matches_ordinary_no_ref_across_cfg_duration_and_kv(self) -> None:
         cases = (
@@ -852,12 +881,8 @@ class InferenceRuntimeSharedConditioningTest(unittest.TestCase):
                         any("ignoring speaker_kv_scale" in msg for msg in prepared_result.messages)
                     )
                 if seconds is None:
-                    self.assertFalse(
-                        ordinary_runtime.model.duration_has_speaker[-1].any().item()
-                    )
-                    self.assertFalse(
-                        prepared_runtime.model.duration_has_speaker[-1].any().item()
-                    )
+                    self.assertFalse(ordinary_runtime.model.duration_has_speaker[-1].any().item())
+                    self.assertFalse(prepared_runtime.model.duration_has_speaker[-1].any().item())
                 else:
                     self.assertEqual(ordinary_runtime.model.duration_has_speaker, [])
                     self.assertEqual(prepared_runtime.model.duration_has_speaker, [])
@@ -884,9 +909,7 @@ class InferenceRuntimeSharedConditioningTest(unittest.TestCase):
             "speaker_kv_scale": 2.0,
         }
         with patch("irodori_tts.inference_runtime.sample_euler_rf_cfg", _zero_sampler):
-            ordinary = ordinary_runtime.synthesize(
-                SamplingRequest(no_ref=True, **request_kwargs)
-            )
+            ordinary = ordinary_runtime.synthesize(SamplingRequest(no_ref=True, **request_kwargs))
             reused = prepared_runtime.synthesize(
                 SamplingRequest(**request_kwargs), prepared_reference=prepared
             )
@@ -1048,6 +1071,20 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
         runtime = self._runtime()
         self.assertEqual(runtime.lifecycle_state, RuntimeLifecycle.BASE_READY)
         self.assertIsNone(runtime.character_lora_adapter)
+        self.assertRegex(runtime.runtime_generation, r"^[0-9a-f]{32}$")
+
+    def test_runtime_generation_is_stable_through_character_lock_and_unique_per_runtime(
+        self,
+    ) -> None:
+        runtime = self._runtime()
+        other_runtime = self._runtime()
+        generation = runtime.runtime_generation
+
+        runtime.finalize_character()
+
+        self.assertEqual(runtime.runtime_generation, generation)
+        self.assertNotEqual(runtime.runtime_generation, other_runtime.runtime_generation)
+        self.assertIsNot(runtime._runtime_owner_token, runtime.runtime_generation)
 
     def test_no_lora_finalize_locks_character(self) -> None:
         runtime = self._runtime()
@@ -1214,9 +1251,7 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
         incomplete = self._clone_state(
             self.adapter_a,
             "preflight-incomplete",
-            lambda state: {
-                key: value for key, value in state.items() if ".lora_B." not in key
-            },
+            lambda state: {key: value for key, value in state.items() if ".lora_B." not in key},
         )
         runtime = self._runtime()
         with self.assertRaisesRegex(ValueError, "Incomplete character LoRA"):
@@ -1231,29 +1266,21 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
         cases = {
             "a-only": (
                 self.adapter_a,
-                lambda state: {
-                    key: value for key, value in state.items() if ".lora_B." not in key
-                },
+                lambda state: {key: value for key, value in state.items() if ".lora_B." not in key},
             ),
             "b-only": (
                 self.adapter_a,
-                lambda state: {
-                    key: value for key, value in state.items() if ".lora_A." not in key
-                },
+                lambda state: {key: value for key, value in state.items() if ".lora_A." not in key},
             ),
             "missing-target-layer": (
                 self.adapter_two_targets,
                 lambda state: {
-                    key: value
-                    for key, value in state.items()
-                    if "out_proj.lora_" not in key
+                    key: value for key, value in state.items() if "out_proj.lora_" not in key
                 },
             ),
             "auxiliary-only": (
                 self.adapter_duration,
-                lambda state: {
-                    key: value for key, value in state.items() if "lora_" not in key
-                },
+                lambda state: {key: value for key, value in state.items() if "lora_" not in key},
             ),
         }
         for name, (source, transform) in cases.items():
@@ -1277,9 +1304,9 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
             return state
 
         def with_original(state):
-            state[
-                "base_model.model.speaker_encoder.in_proj.original_module.weight"
-            ] = self.base_state["speaker_encoder.in_proj.weight"].clone()
+            state["base_model.model.speaker_encoder.in_proj.original_module.weight"] = (
+                self.base_state["speaker_encoder.in_proj.weight"].clone()
+            )
             return state
 
         for name, transform in (
@@ -1347,11 +1374,7 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
 
     def test_sparse_duration_predictor_layout_rejects_before_mutation(self) -> None:
         def make_auxiliary_sparse(state):
-            key = next(
-                key
-                for key in state
-                if ".duration_predictor." in key and "lora_" not in key
-            )
+            key = next(key for key in state if ".duration_predictor." in key and "lora_" not in key)
             state[key] = state[key].to_sparse()
             return state
 
@@ -1420,9 +1443,7 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
             "trainable-tokens": {
                 "trainable_token_indices": {"text_encoder.text_embedding": [1, 2]}
             },
-            "target-parameters": {
-                "target_parameters": ["speaker_encoder.in_proj.weight"]
-            },
+            "target-parameters": {"target_parameters": ["speaker_encoder.in_proj.weight"]},
             "initializer-false": {"init_lora_weights": False},
             "initializer-gaussian": {"init_lora_weights": "gaussian"},
             "bias-all": {"bias": "all"},
@@ -1741,7 +1762,6 @@ class InferenceRuntimeCharacterLifecycleTest(unittest.TestCase):
         self.assertEqual(speaker_forward.call_count, 1)
         self.assertEqual(result.used_seed, 41)
         self.assertEqual(result.audio.shape, (1, 4))
-
 
 
 if __name__ == "__main__":

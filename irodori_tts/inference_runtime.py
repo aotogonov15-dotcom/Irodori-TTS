@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import io
 import json
 import math
 import secrets
@@ -72,7 +73,9 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
         if not _is_xpu_available():
             raise ValueError("XPU device requested but torch.xpu.is_available() is False.")
         return torch.device("xpu")
-    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu.")
+    raise ValueError(
+        f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu."
+    )
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -353,6 +356,7 @@ class SamplingRequest:
     tail_std_threshold: float = 0.05
     tail_mean_threshold: float = 0.1
     lora_adapter: str | None = None
+    ref_wav_bytes: bytes | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -608,6 +612,7 @@ class InferenceRuntime:
         self._model_dtype = next(self.model.parameters()).dtype
         self._lifecycle_state = RuntimeLifecycle.BASE_READY
         self._runtime_owner_token = object()
+        self._runtime_generation = secrets.token_hex(16)
         self._character_lora_adapter: str | None = None
         self._character_adapter_name: str | None = None
         self._failure_reason: str | None = None
@@ -704,6 +709,11 @@ class InferenceRuntime:
     @property
     def lifecycle_state(self) -> RuntimeLifecycle:
         return self._lifecycle_state
+
+    @property
+    def runtime_generation(self) -> str:
+        """Wire-safe identity for this one runtime lifetime."""
+        return self._runtime_generation
 
     @property
     def character_lora_adapter(self) -> str | None:
@@ -874,8 +884,21 @@ class InferenceRuntime:
         messages: list[str],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         runtime_dtype = next(self.model.parameters()).dtype
+        reference_source_count = (
+            int(req.ref_wav is not None)
+            + int(req.ref_wav_bytes is not None)
+            + int(req.ref_latent is not None)
+        )
+        if reference_source_count > 1:
+            raise ValueError("Specify only one reference audio or latent source.")
+        if req.no_ref and reference_source_count:
+            raise ValueError("Reference input cannot be combined with no_ref=True.")
         if not self.model_cfg.use_speaker_condition_resolved:
-            if req.ref_wav is not None or req.ref_latent is not None:
+            if (
+                req.ref_wav is not None
+                or req.ref_wav_bytes is not None
+                or req.ref_latent is not None
+            ):
                 messages.append(
                     "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
                 )
@@ -896,7 +919,7 @@ class InferenceRuntime:
             )
             return ref_latent_patched, ref_mask
 
-        if req.ref_wav is None and req.ref_latent is None:
+        if req.ref_wav is None and req.ref_wav_bytes is None and req.ref_latent is None:
             raise ValueError("Specify either ref_wav/ref_latent, or set no_ref=True.")
 
         max_ref_latent_steps = None
@@ -917,7 +940,11 @@ class InferenceRuntime:
             ).unsqueeze(0)
             ref_latent = ref_latent.to(dtype=runtime_dtype)
         else:
-            wav, sr = _load_audio(req.ref_wav)
+            wav, sr = (
+                _load_audio_bytes(req.ref_wav_bytes)
+                if req.ref_wav_bytes is not None
+                else _load_audio(req.ref_wav)
+            )
             if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
                 max_ref_samples = max(1, int(float(req.max_ref_seconds) * float(sr)))
                 if wav.shape[1] > max_ref_samples:
@@ -980,7 +1007,12 @@ class InferenceRuntime:
                 "info: speaker conditioning is disabled for this checkpoint; ignoring speaker embedding."
             )
             return None, None
-        if req.ref_wav is not None or req.ref_latent is not None or req.no_ref:
+        if (
+            req.ref_wav is not None
+            or req.ref_wav_bytes is not None
+            or req.ref_latent is not None
+            or req.no_ref
+        ):
             raise ValueError(
                 "ref_embed/--ref-embed cannot be combined with ref_wav/ref_latent/no_ref. "
                 "Use exactly one speaker conditioning source."
@@ -1047,6 +1079,7 @@ class InferenceRuntime:
         self,
         *,
         ref_wav: str | None = None,
+        ref_wav_bytes: bytes | None = None,
         ref_latent: str | None = None,
         ref_embed: str | None = None,
         no_ref: bool = False,
@@ -1060,6 +1093,7 @@ class InferenceRuntime:
         req = SamplingRequest(
             text="",
             ref_wav=ref_wav,
+            ref_wav_bytes=ref_wav_bytes,
             ref_latent=ref_latent,
             ref_embed=ref_embed,
             no_ref=no_ref,
@@ -1218,6 +1252,7 @@ class InferenceRuntime:
             )
         if prepared_reference is not None and (
             req.ref_wav is not None
+            or req.ref_wav_bytes is not None
             or req.ref_latent is not None
             or req.ref_embed is not None
             or req.no_ref
@@ -1695,8 +1730,7 @@ def preload_cached_runtime(key: RuntimeKey) -> RuntimePreloadInfo:
         if (
             _RUNTIME_CACHE_VALUE is not None
             and _RUNTIME_CACHE_KEY == key
-            and _runtime_cache_ownership(_RUNTIME_CACHE_VALUE)
-            == _RuntimeCacheOwnership.CACHED
+            and _runtime_cache_ownership(_RUNTIME_CACHE_VALUE) == _RuntimeCacheOwnership.CACHED
             and _RUNTIME_CACHE_VALUE.lifecycle_state == RuntimeLifecycle.BASE_READY
         ):
             return _preload_info(_RUNTIME_CACHE_VALUE, reloaded=False)
@@ -1730,8 +1764,7 @@ def claim_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
         if (
             _RUNTIME_CACHE_VALUE is not None
             and _RUNTIME_CACHE_KEY == key
-            and _runtime_cache_ownership(_RUNTIME_CACHE_VALUE)
-            == _RuntimeCacheOwnership.CACHED
+            and _runtime_cache_ownership(_RUNTIME_CACHE_VALUE) == _RuntimeCacheOwnership.CACHED
             and _RUNTIME_CACHE_VALUE.lifecycle_state == RuntimeLifecycle.BASE_READY
         ):
             runtime = _RUNTIME_CACHE_VALUE
@@ -1864,6 +1897,23 @@ def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
 
         data, sr = sf.read(str(path), dtype="float32")
         wav = torch.from_numpy(data)
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        else:
+            wav = wav.T
+        return wav, sr
+
+
+def _load_audio_bytes(data: bytes) -> tuple[torch.Tensor, int]:
+    if not data:
+        raise ValueError("Reference audio snapshot is empty.")
+    try:
+        return torchaudio.load(io.BytesIO(data))
+    except RuntimeError:
+        import soundfile as sf
+
+        samples, sr = sf.read(io.BytesIO(data), dtype="float32")
+        wav = torch.from_numpy(samples)
         if wav.ndim == 1:
             wav = wav.unsqueeze(0)
         else:

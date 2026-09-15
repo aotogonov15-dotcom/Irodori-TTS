@@ -8,11 +8,11 @@ from huggingface_hub import hf_hub_download
 
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
+    PreparedReferenceConditioning,
     RuntimeKey,
     SamplingRequest,
     save_wav,
 )
-
 
 # =========================================================
 # モデル設定
@@ -73,6 +73,12 @@ class VoiceEngine:
 
         return self._runtime is not None
 
+    @property
+    def runtime_generation(self) -> str:
+        if self._runtime is None:
+            raise RuntimeError("音声生成エンジンが読み込まれていません。")
+        return self._runtime.runtime_generation
+
     def load(self) -> None:
         """参照音声に依存せずモデルとCodecを読み込む。読み込み済みなら何もしない。"""
 
@@ -118,52 +124,131 @@ class VoiceEngine:
 
         if self._runtime is None:
             raise RuntimeError(
-                "音声生成エンジンが読み込まれていません。"
-                "先にload()を実行してください。"
+                "音声生成エンジンが読み込まれていません。先にload()を実行してください。"
             )
 
         active_reference_audio = (
-            Path(reference_audio)
-            if reference_audio is not None
-            else self.reference_audio
+            Path(reference_audio) if reference_audio is not None else self.reference_audio
         )
 
         if active_reference_audio is None or not active_reference_audio.is_file():
             raise FileNotFoundError(
-                "参照音声ファイルが見つかりません。\n"
-                f"確認する場所: {active_reference_audio}"
+                f"参照音声ファイルが見つかりません。\n確認する場所: {active_reference_audio}"
             )
 
         result = self._runtime.synthesize(
-            SamplingRequest(
-                text=cleaned_text,
+            self._sampling_request(
+                cleaned_text,
+                active_settings,
                 ref_wav=str(active_reference_audio),
-
-                num_steps=active_settings.num_steps,
-                t_schedule_mode=active_settings.t_schedule_mode,
-                sway_coeff=active_settings.sway_coeff,
-
-                cfg_guidance_mode=active_settings.cfg_guidance_mode,
-                cfg_scale_text=active_settings.cfg_scale_text,
-                cfg_scale_speaker=active_settings.cfg_scale_speaker,
-
-                duration_scale=active_settings.duration_scale,
-                seed=active_settings.seed,
-
-                num_candidates=active_settings.num_candidates,
-                decode_mode=active_settings.decode_mode,
-
-                ref_normalize_db=active_settings.ref_normalize_db,
-                ref_ensure_max=active_settings.ref_ensure_max,
-                max_ref_seconds=active_settings.max_ref_seconds,
             ),
             log_fn=None,
         )
 
+        return self._save_result(result, output_path)
+
+    def prepare_reference_conditioning(
+        self,
+        reference_snapshot: bytes,
+        *,
+        ref_normalize_db: float | None,
+        ref_ensure_max: bool,
+        max_ref_seconds: float | None,
+    ) -> PreparedReferenceConditioning:
+        """Prepare from the exact immutable bytes hashed by the worker."""
+        runtime = self._require_runtime()
+        return runtime.prepare_reference_conditioning(
+            ref_wav_bytes=reference_snapshot,
+            ref_normalize_db=ref_normalize_db,
+            ref_ensure_max=ref_ensure_max,
+            max_ref_seconds=max_ref_seconds,
+        )
+
+    def generate_with_prepared(
+        self,
+        text: str,
+        prepared_reference: PreparedReferenceConditioning,
+        settings: VoiceGenerationSettings | None = None,
+        output_path: str | Path | None = None,
+    ) -> VoiceGenerationResult:
+        """Generate from worker-owned Prepared state without injecting a default WAV."""
+        cleaned_text = text.strip()
+        if not cleaned_text:
+            raise ValueError("文章が入力されていません。")
+        runtime = self._require_runtime()
+        active_settings = settings or VoiceGenerationSettings()
+        result = runtime.synthesize(
+            self._sampling_request(cleaned_text, active_settings),
+            log_fn=None,
+            prepared_reference=prepared_reference,
+        )
+        return self._save_result(result, output_path)
+
+    def generate_no_ref(
+        self,
+        text: str,
+        settings: VoiceGenerationSettings | None = None,
+        output_path: str | Path | None = None,
+    ) -> VoiceGenerationResult:
+        cleaned_text = text.strip()
+        if not cleaned_text:
+            raise ValueError("文章が入力されていません。")
+        runtime = self._require_runtime()
+        active_settings = settings or VoiceGenerationSettings()
+        result = runtime.synthesize(
+            self._sampling_request(cleaned_text, active_settings, no_ref=True),
+            log_fn=None,
+        )
+        return self._save_result(result, output_path)
+
+    def close(self) -> None:
+        runtime = self._runtime
+        self._runtime = None
+        if runtime is not None:
+            runtime.unload()
+
+    def _require_runtime(self) -> InferenceRuntime:
+        if self._runtime is None:
+            raise RuntimeError(
+                "音声生成エンジンが読み込まれていません。先にload()を実行してください。"
+            )
+        return self._runtime
+
+    @staticmethod
+    def _sampling_request(
+        text: str,
+        settings: VoiceGenerationSettings,
+        *,
+        ref_wav: str | None = None,
+        no_ref: bool = False,
+    ) -> SamplingRequest:
+        return SamplingRequest(
+            text=text,
+            ref_wav=ref_wav,
+            no_ref=no_ref,
+            num_steps=settings.num_steps,
+            t_schedule_mode=settings.t_schedule_mode,
+            sway_coeff=settings.sway_coeff,
+            cfg_guidance_mode=settings.cfg_guidance_mode,
+            cfg_scale_text=settings.cfg_scale_text,
+            cfg_scale_speaker=settings.cfg_scale_speaker,
+            duration_scale=settings.duration_scale,
+            seed=settings.seed,
+            num_candidates=settings.num_candidates,
+            decode_mode=settings.decode_mode,
+            ref_normalize_db=settings.ref_normalize_db,
+            ref_ensure_max=settings.ref_ensure_max,
+            max_ref_seconds=settings.max_ref_seconds,
+        )
+
+    def _save_result(
+        self,
+        result: object,
+        output_path: str | Path | None,
+    ) -> VoiceGenerationResult:
+
         active_output_path = (
-            Path(output_path)
-            if output_path is not None
-            else self._create_output_path()
+            Path(output_path) if output_path is not None else self._create_output_path()
         )
 
         saved_path = save_wav(

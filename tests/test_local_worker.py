@@ -6,7 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from irodori_tts.local_worker import _configure_standard_streams, run_worker
+import torch
+
+from irodori_tts.inference_runtime import PreparedReferenceConditioning
+from irodori_tts.local_worker import PROTOCOL_VERSION, _configure_standard_streams, run_worker
 from voice_engine import VoiceGenerationResult, VoiceGenerationSettings
 
 
@@ -15,13 +18,18 @@ class FakeVoiceEngine:
     fail_load = False
     fail_load_count = 0
     load_error: BaseException | None = None
+    next_generation = 1
 
     def __init__(self, reference_audio: Path | None, output_dir: Path) -> None:
         self.reference_audio = reference_audio
         self.output_dir = output_dir
         self.load_count = 0
         self.generate_calls = []
+        self.prepare_calls = []
+        self.close_count = 0
         self.fail_next_generate = False
+        self.runtime_generation = f"{FakeVoiceEngine.next_generation:032x}"
+        FakeVoiceEngine.next_generation += 1
         FakeVoiceEngine.instances.append(self)
         print("factory stdout log")
 
@@ -60,6 +68,49 @@ class FakeVoiceEngine:
             generation_seconds=0.25,
         )
 
+    def prepare_reference_conditioning(self, reference_snapshot, **preprocessing):
+        self.prepare_calls.append(
+            {
+                "reference_snapshot": reference_snapshot,
+                "preprocessing": preprocessing,
+            }
+        )
+        token = max(1, reference_snapshot[0] if reference_snapshot else 1)
+        return PreparedReferenceConditioning(
+            speaker_state=torch.full((1, 2, 2), float(token), dtype=torch.float32),
+            speaker_mask=torch.ones((1, 2), dtype=torch.bool),
+            _lora_adapter=None,
+        )
+
+    def generate_with_prepared(
+        self,
+        text,
+        prepared_reference,
+        settings=None,
+        output_path=None,
+    ):
+        result = self.generate(
+            text,
+            reference_audio=None,
+            settings=settings,
+            output_path=output_path,
+        )
+        self.generate_calls[-1]["prepared_reference"] = prepared_reference
+        return result
+
+    def generate_no_ref(self, text, settings=None, output_path=None):
+        result = self.generate(
+            text,
+            reference_audio=None,
+            settings=settings,
+            output_path=output_path,
+        )
+        self.generate_calls[-1]["no_ref"] = True
+        return result
+
+    def close(self) -> None:
+        self.close_count += 1
+
 
 class LocalWorkerTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -67,6 +118,7 @@ class LocalWorkerTest(unittest.TestCase):
         FakeVoiceEngine.fail_load = False
         FakeVoiceEngine.fail_load_count = 0
         FakeVoiceEngine.load_error = None
+        FakeVoiceEngine.next_generation = 1
 
     def test_preload_loads_engine_without_generating(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -81,15 +133,13 @@ class LocalWorkerTest(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(
-            response,
-            {
-                "id": "preload-1",
-                "ok": True,
-                "ready": True,
-                "already_loaded": False,
-            },
-        )
+        self.assertEqual(response["id"], "preload-1")
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["ready"])
+        self.assertFalse(response["already_loaded"])
+        self.assertEqual(response["protocol_version"], PROTOCOL_VERSION)
+        self.assertEqual(response["capabilities"], ["no_ref", "prepared_voice_handles"])
+        self.assertEqual(response["runtime_generation"], "00000000000000000000000000000001")
         self.assertEqual(len(FakeVoiceEngine.instances), 1)
         self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
         self.assertEqual(FakeVoiceEngine.instances[0].generate_calls, [])
@@ -106,15 +156,10 @@ class LocalWorkerTest(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(
-            response,
-            {
-                "id": "preload-1",
-                "ok": True,
-                "ready": True,
-                "already_loaded": False,
-            },
-        )
+        self.assertTrue(response["ok"])
+        self.assertFalse(response["already_loaded"])
+        self.assertEqual(response["protocol_version"], PROTOCOL_VERSION)
+        self.assertEqual(response["runtime_generation"], "00000000000000000000000000000001")
         self.assertEqual(len(FakeVoiceEngine.instances), 1)
         self.assertIsNone(FakeVoiceEngine.instances[0].reference_audio)
         self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
@@ -366,18 +411,15 @@ class LocalWorkerTest(unittest.TestCase):
                 ]
             )
 
-        self.assertEqual(
-            responses,
-            [
-                {
-                    "id": "request-1",
-                    "ok": True,
-                    "output_path": str(output_path.resolve()),
-                    "used_seed": 1234,
-                    "generation_seconds": 0.25,
-                }
-            ],
-        )
+        self.assertEqual(len(responses), 1)
+        response = responses[0]
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["output_path"], str(output_path.resolve()))
+        self.assertEqual(response["used_seed"], 1234)
+        self.assertEqual(response["generation_seconds"], 0.25)
+        self.assertIsNotNone(response["prepared_voice_id"])
+        self.assertTrue(response["cached"])
+        self.assertFalse(response["cache_hit"])
 
     def test_multiple_requests_reuse_loaded_engine_and_pass_output_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -409,7 +451,8 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertEqual(len(engine.generate_calls), 2)
         self.assertEqual(engine.generate_calls[0]["output_path"], output1.resolve())
         self.assertEqual(engine.generate_calls[1]["output_path"], output2.resolve())
-        self.assertEqual(engine.generate_calls[1]["reference_audio"], reference2.resolve())
+        self.assertIsNone(engine.generate_calls[1]["reference_audio"])
+        self.assertEqual(len(engine.prepare_calls), 1)
         self.assertTrue(all(response["ok"] for response in responses))
 
     def test_default_settings_are_used_when_settings_omitted(self) -> None:
@@ -660,7 +703,9 @@ class LocalWorkerTest(unittest.TestCase):
                 ),
                 {"id": "shutdown-1", "type": "shutdown"},
             ]
-            raw_input = "".join(json.dumps(request, ensure_ascii=True) + "\n" for request in requests)
+            raw_input = "".join(
+                json.dumps(request, ensure_ascii=True) + "\n" for request in requests
+            )
             responses, _stderr = self._run_protocol_bytes(raw_input.encode("ascii"))
 
         self.assertEqual([response["id"] for response in responses], ["request-1", "shutdown-1"])

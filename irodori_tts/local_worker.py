@@ -2,20 +2,41 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import sys
+import time
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+from irodori_tts.prepared_voice_cache import (
+    DEFAULT_MAX_CACHE_BYTES,
+    DEFAULT_MAX_CACHE_ENTRIES,
+    DEFAULT_MAX_REFERENCE_BYTES,
+    CacheClosedError,
+    CacheInvariantError,
+    PreparedVoiceAcquisition,
+    PreparedVoiceCache,
+    ReferencePreprocessing,
+    ReferenceSnapshot,
+    ReferenceSnapshotError,
+    StalePreparedVoiceHandle,
+    snapshot_reference_file,
+)
 from irodori_tts.voice_engine import (
     VoiceEngine,
     VoiceGenerationResult,
     VoiceGenerationSettings,
 )
 
-
 EngineFactory = Callable[[Path | None, Path], Any]
+
+PROTOCOL_VERSION = 3
+CAPABILITIES = ("no_ref", "prepared_voice_handles")
+_HANDLE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_REVISION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 _SETTINGS_TYPES: dict[str, type | tuple[type, ...]] = {
     "num_steps": int,
@@ -33,13 +54,30 @@ _SETTINGS_TYPES: dict[str, type | tuple[type, ...]] = {
     "max_ref_seconds": (int, float),
 }
 _ALLOWED_SETTINGS = set(_SETTINGS_TYPES)
+_PREPROCESSING_FIELDS = {"ref_normalize_db", "ref_ensure_max", "max_ref_seconds"}
 
 
 class WorkerError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        stage: str | None = None,
+        reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.stage = stage
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class _ReferenceRequest:
+    path: Path
+    preprocessing: ReferencePreprocessing
+    legacy: bool = False
 
 
 class LocalWorker:
@@ -49,11 +87,26 @@ class LocalWorker:
         output_stream: TextIO,
         error_stream: TextIO,
         engine_factory: EngineFactory,
+        cache_max_entries: int = DEFAULT_MAX_CACHE_ENTRIES,
+        cache_max_bytes: int = DEFAULT_MAX_CACHE_BYTES,
+        max_reference_bytes: int = DEFAULT_MAX_REFERENCE_BYTES,
     ) -> None:
         self.output_stream = output_stream
         self.error_stream = error_stream
         self.engine_factory = engine_factory
+        self.cache_max_entries = cache_max_entries
+        self.cache_max_bytes = cache_max_bytes
+        self.max_reference_bytes = max_reference_bytes
         self.engine: Any | None = None
+        self.cache: PreparedVoiceCache | None = None
+        self._closed = False
+
+    @property
+    def runtime_generation(self) -> str | None:
+        if self.engine is None:
+            return None
+        generation = getattr(self.engine, "runtime_generation", None)
+        return generation if isinstance(generation, str) and generation else None
 
     def process_line(self, line: str) -> bool:
         request_id: Any = None
@@ -62,7 +115,13 @@ class LocalWorker:
             request_id = _extract_response_id(request)
             response, should_continue = self._handle_request(request)
         except WorkerError as error:
-            response = _error_response(request_id, error.code, error.message)
+            response = _error_response(
+                request_id,
+                error.code,
+                error.message,
+                stage=error.stage,
+                reason=error.reason,
+            )
             should_continue = True
         except Exception as error:  # pragma: no cover - defensive guard
             _print_traceback(self.error_stream)
@@ -76,14 +135,59 @@ class LocalWorker:
         self._write_response(response)
         return should_continue
 
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        cache = self.cache
+        self.cache = None
+        if cache is not None:
+            entries = cache.entry_count
+            estimated_bytes = cache.estimated_bytes
+            cache.close()
+            self._log(
+                "worker",
+                "cache_close",
+                entries=entries,
+                estimated_bytes=estimated_bytes,
+            )
+        engine = self.engine
+        self.engine = None
+        if engine is not None:
+            _redirect_stdout_to_stderr(self.error_stream, engine.close)
+            self._log("worker", "engine_close")
+
     def _handle_request(self, request: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         request_id = _validate_request_id(request.get("id"))
         request_type = request.get("type")
 
         if request_type == "shutdown":
+            try:
+                self.close()
+            except Exception:
+                _print_traceback(self.error_stream)
+                return (
+                    _error_response(
+                        request_id,
+                        "runtime_unavailable",
+                        "workerの終了処理に失敗しました。",
+                        stage="shutdown",
+                        reason="close_failed",
+                    ),
+                    False,
+                )
             return {"id": request_id, "ok": True}, False
+        if self._closed:
+            raise WorkerError(
+                "runtime_unavailable",
+                "workerは終了処理済みです。",
+                stage="request",
+                reason="worker_closed",
+            )
         if request_type == "preload":
             return self._handle_preload(request, request_id), True
+        if request_type == "prepare_voice":
+            return self._handle_prepare_voice(request, request_id), True
         if request_type != "generate":
             raise WorkerError("unknown_request", "未対応のrequest typeです。")
 
@@ -96,31 +200,298 @@ class LocalWorker:
 
         self._log(request_id, "preload_start")
         self._ensure_engine(reference_audio, output_dir)
-        self._log(request_id, "preload_ok")
+        generation = self._require_current_generation()
+        self._log(request_id, "preload_ok", runtime_generation=generation)
         return {
             "id": request_id,
             "ok": True,
             "ready": True,
             "already_loaded": already_loaded,
+            "protocol_version": PROTOCOL_VERSION,
+            "capabilities": list(CAPABILITIES),
+            "runtime_generation": generation,
+        }
+
+    def _handle_prepare_voice(
+        self,
+        request: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        if "no_ref" in request:
+            raise WorkerError(
+                "invalid_request",
+                "prepare_voiceではno_refを使用できません。",
+                stage="validation",
+                reason="no_ref_not_preparable",
+            )
+        unsupported = set(request) - {"id", "type", "runtime_generation", "reference"}
+        if unsupported:
+            raise WorkerError(
+                "invalid_request",
+                "prepare_voiceに未対応fieldを指定できません。",
+                stage="validation",
+                reason="unsupported_prepare_field",
+            )
+        engine = self._require_engine()
+        generation = self._validate_runtime_generation(request, required=True)
+        reference = _validate_reference_request(request.get("reference"))
+        snapshot = self._snapshot(reference)
+        acquisition, duration = self._prepare_snapshot(engine, snapshot)
+        if not acquisition.cached:
+            self._log_cache_result(request_id, acquisition, duration, snapshot.revision)
+            raise WorkerError(
+                "prepare_failed",
+                "Prepared voiceがcache容量を超えています。",
+                stage="prepare",
+                reason="capacity_exceeded",
+            )
+        self._log_cache_result(request_id, acquisition, duration, snapshot.revision)
+        return {
+            "id": request_id,
+            "ok": True,
+            "prepared_voice_id": acquisition.entry.prepared_voice_id,
+            "runtime_generation": generation,
+            "reference_revision": snapshot.revision,
+            "cache_hit": acquisition.cache_hit,
         }
 
     def _handle_generate(self, request: dict[str, Any], request_id: str) -> dict[str, Any]:
         text = _validate_text(request.get("text"))
-        reference_audio = _validate_reference_audio(request.get("reference_audio"))
         output_path = _validate_output_path(request.get("output_path"))
         settings_payload = request["settings"] if "settings" in request else {}
         settings = _validate_settings(settings_payload)
+        no_ref = _validate_no_ref(request.get("no_ref", False))
+        raw_handle = request.get("prepared_voice_id")
+        has_handle = raw_handle is not None
+        has_reference = request.get("reference") is not None
+        has_legacy_reference = request.get("reference_audio") is not None
 
-        self._log(request_id, "generate_start")
-        try:
-            engine = self._ensure_engine(reference_audio, output_path.parent)
-            result = _redirect_stdout_to_stderr(
-                self.error_stream,
-                engine.generate,
+        if has_reference and has_legacy_reference:
+            raise _contradictory("reference_and_reference_audio")
+        if no_ref and (has_handle or has_reference or has_legacy_reference):
+            raise _contradictory("no_ref_with_reference")
+        if has_handle and has_legacy_reference:
+            raise _contradictory("handle_with_legacy_reference")
+        if not no_ref and not has_handle and not has_reference and not has_legacy_reference:
+            raise WorkerError("missing_reference", "参照音声を指定してください。")
+        if "reference_revision" in request and not (has_handle and has_reference):
+            raise _contradictory("unexpected_reference_revision")
+        if has_handle and has_reference and "reference_revision" not in request:
+            raise _contradictory("missing_reference_revision")
+        fallback_revision = (
+            _validate_reference_revision(request.get("reference_revision"))
+            if has_handle and has_reference
+            else None
+        )
+        handle = _validate_prepared_voice_id(raw_handle) if has_handle else None
+
+        reference = None
+        if has_reference:
+            settings_preprocessing = _preprocessing_from_settings(settings)
+            reference = _validate_reference_request(
+                request["reference"],
+                default_preprocessing=settings_preprocessing,
+            )
+            _reject_conflicting_preprocessing(
+                request["reference"],
+                settings_payload,
+                reference.preprocessing,
+                settings_preprocessing,
+            )
+        elif has_legacy_reference:
+            reference = _ReferenceRequest(
+                path=_validate_reference_audio(request["reference_audio"]),
+                preprocessing=_preprocessing_from_settings(settings),
+                legacy=True,
+            )
+
+        self._log(request_id, "generate_start", runtime_generation=self.runtime_generation)
+        engine = (
+            self._require_engine()
+            if has_handle
+            else self._ensure_engine(
+                None if reference is None else reference.path,
+                output_path.parent,
+            )
+        )
+        generation = self._validate_runtime_generation(request, required=has_handle)
+
+        if no_ref:
+            result = self._run_generate(
+                engine.generate_no_ref,
                 text,
-                reference_audio=reference_audio,
                 settings=settings,
                 output_path=output_path,
+            )
+            return self._generation_response(
+                request_id,
+                result,
+                generation=generation,
+                prepared_voice_id=None,
+                reference_revision_value=None,
+                cached=False,
+                cache_hit=False,
+            )
+
+        acquisition: PreparedVoiceAcquisition
+        revision: str
+        if has_handle:
+            cache = self._require_cache()
+            try:
+                entry = cache.acquire_handle(handle)
+                acquisition = PreparedVoiceAcquisition(
+                    prepared=entry.prepared,
+                    entry=entry,
+                    cache_hit=True,
+                    estimated_bytes=entry.estimated_bytes,
+                )
+                revision = entry.key.reference_revision
+                self._log(
+                    request_id,
+                    "cache_hit",
+                    runtime_generation=generation,
+                    entries=cache.entry_count,
+                    estimated_bytes=cache.estimated_bytes,
+                )
+            except StalePreparedVoiceHandle:
+                self._log(request_id, "stale_handle", runtime_generation=generation)
+                if reference is None:
+                    raise WorkerError(
+                        "stale_handle",
+                        "prepared_voice_idは存在しないか失効しています。",
+                        stage="handle_resolution",
+                        reason="not_resident",
+                    ) from None
+                _reject_same_reference_and_output(reference.path, output_path)
+                snapshot = self._snapshot(reference)
+                if snapshot.revision != fallback_revision:
+                    raise WorkerError(
+                        "invalid_reference",
+                        "fallback参照音声が期待されたrevisionと一致しません。",
+                        stage="fallback",
+                        reason="revision_mismatch",
+                    ) from None
+                self._log(request_id, "fallback", runtime_generation=generation)
+                acquisition, duration = self._prepare_snapshot(engine, snapshot)
+                self._log_cache_result(request_id, acquisition, duration, snapshot.revision)
+                revision = snapshot.revision
+            except (CacheClosedError, CacheInvariantError) as error:
+                raise WorkerError(
+                    "runtime_unavailable",
+                    "Prepared voice cacheを利用できません。",
+                    stage="handle_resolution",
+                    reason="cache_invariant",
+                ) from error
+        else:
+            if reference is None:  # pragma: no cover - guarded above
+                raise CacheInvariantError("Reference form was lost after validation.")
+            _reject_same_reference_and_output(reference.path, output_path)
+            snapshot = self._snapshot(reference)
+            acquisition, duration = self._prepare_snapshot(engine, snapshot)
+            self._log_cache_result(request_id, acquisition, duration, snapshot.revision)
+            revision = snapshot.revision
+
+        try:
+            result = self._run_generate(
+                engine.generate_with_prepared,
+                text,
+                acquisition.prepared,
+                settings=settings,
+                output_path=output_path,
+            )
+        except WorkerError as error:
+            if "runtime-owner mismatch" in str(error.__cause__):
+                raise WorkerError(
+                    "runtime_unavailable",
+                    "Prepared voiceのRuntime ownership検証に失敗しました。",
+                    stage="synthesize",
+                    reason="owner_mismatch",
+                ) from error
+            raise
+
+        return self._generation_response(
+            request_id,
+            result,
+            generation=generation,
+            prepared_voice_id=(
+                None if acquisition.entry is None else acquisition.entry.prepared_voice_id
+            ),
+            reference_revision_value=revision,
+            cached=acquisition.cached,
+            cache_hit=acquisition.cache_hit,
+        )
+
+    def _prepare_snapshot(
+        self,
+        engine: Any,
+        snapshot: ReferenceSnapshot,
+    ) -> tuple[PreparedVoiceAcquisition, float]:
+        cache = self._require_cache()
+        key = cache.cache_key(snapshot.revision)
+        started = time.perf_counter()
+        try:
+            acquisition = cache.get_or_prepare(
+                key,
+                lambda: _redirect_stdout_to_stderr(
+                    self.error_stream,
+                    engine.prepare_reference_conditioning,
+                    snapshot.data,
+                    ref_normalize_db=snapshot.preprocessing.ref_normalize_db,
+                    ref_ensure_max=snapshot.preprocessing.ref_ensure_max,
+                    max_ref_seconds=snapshot.preprocessing.max_ref_seconds,
+                ),
+            )
+        except CacheClosedError as error:
+            raise WorkerError(
+                "runtime_unavailable",
+                "Prepared voice cacheは終了処理済みです。",
+                stage="prepare",
+                reason="cache_closed",
+            ) from error
+        except CacheInvariantError as error:
+            raise WorkerError(
+                "runtime_unavailable",
+                "Prepared voice cacheのRuntime整合性が失われました。",
+                stage="prepare",
+                reason="cache_invariant",
+            ) from error
+        except Exception as error:
+            _print_traceback(self.error_stream)
+            raise WorkerError(
+                "prepare_failed",
+                "参照音声の準備に失敗しました。",
+                stage="prepare",
+                reason="runtime_prepare_failed",
+            ) from error
+        return acquisition, time.perf_counter() - started
+
+    def _snapshot(self, reference: _ReferenceRequest) -> ReferenceSnapshot:
+        try:
+            return snapshot_reference_file(
+                reference.path,
+                reference.preprocessing,
+                max_bytes=self.max_reference_bytes,
+            )
+        except ReferenceSnapshotError as error:
+            code = (
+                "missing_reference"
+                if reference.legacy and error.reason == "not_found"
+                else "invalid_reference"
+            )
+            raise WorkerError(
+                code,
+                "参照音声ファイルを読み込めません。",
+                stage="snapshot",
+                reason=error.reason,
+            ) from error
+
+    def _run_generate(self, generate: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        try:
+            return _redirect_stdout_to_stderr(
+                self.error_stream,
+                generate,
+                *args,
+                **kwargs,
             )
         except WorkerError:
             raise
@@ -132,11 +503,26 @@ class LocalWorker:
         except RuntimeError as error:
             _print_traceback(self.error_stream)
             code = "cuda_failed" if _looks_like_cuda_error(error) else "generation_failed"
-            raise WorkerError(code, _generation_error_message(code)) from error
+            raise WorkerError(code, _generation_error_message(code), stage="synthesize") from error
         except Exception as error:
             _print_traceback(self.error_stream)
-            raise WorkerError("generation_failed", "音声生成に失敗しました。") from error
+            raise WorkerError(
+                "generation_failed",
+                "音声生成に失敗しました。",
+                stage="synthesize",
+            ) from error
 
+    def _generation_response(
+        self,
+        request_id: str,
+        result: Any,
+        *,
+        generation: str,
+        prepared_voice_id: str | None,
+        reference_revision_value: str | None,
+        cached: bool,
+        cache_hit: bool,
+    ) -> dict[str, Any]:
         if not isinstance(result, VoiceGenerationResult):
             output = Path(result.output_path)
             used_seed = int(result.used_seed)
@@ -146,19 +532,33 @@ class LocalWorker:
             used_seed = result.used_seed
             generation_seconds = result.generation_seconds
 
-        self._log(request_id, "generate_ok")
+        self._log(request_id, "generate_ok", runtime_generation=generation)
         return {
             "id": request_id,
             "ok": True,
             "output_path": str(Path(output).resolve()),
             "used_seed": used_seed,
             "generation_seconds": generation_seconds,
+            "prepared_voice_id": prepared_voice_id,
+            "runtime_generation": generation,
+            "reference_revision": reference_revision_value,
+            "cached": cached,
+            "cache_hit": cache_hit,
         }
 
     def _ensure_engine(self, reference_audio: Path | None, output_dir: Path) -> Any:
         if self.engine is not None:
+            self._require_cache()
             return self.engine
+        if self._closed:
+            raise WorkerError(
+                "runtime_unavailable",
+                "workerは終了処理済みです。",
+                stage="load",
+                reason="worker_closed",
+            )
 
+        engine = None
         try:
             engine = _redirect_stdout_to_stderr(
                 self.error_stream,
@@ -167,23 +567,146 @@ class LocalWorker:
                 output_dir,
             )
             _redirect_stdout_to_stderr(self.error_stream, engine.load)
+            generation = getattr(engine, "runtime_generation", None)
+            if not isinstance(generation, str) or not generation:
+                raise RuntimeError("VoiceEngine did not expose a runtime_generation.")
         except RuntimeError as error:
+            if engine is not None and hasattr(engine, "close"):
+                with contextlib.suppress(Exception):
+                    _redirect_stdout_to_stderr(self.error_stream, engine.close)
             _print_traceback(self.error_stream)
             code = "cuda_failed" if _looks_like_cuda_error(error) else "model_load_failed"
-            raise WorkerError(code, _model_load_error_message(code)) from error
+            raise WorkerError(code, _model_load_error_message(code), stage="load") from error
         except Exception as error:
+            if engine is not None and hasattr(engine, "close"):
+                with contextlib.suppress(Exception):
+                    _redirect_stdout_to_stderr(self.error_stream, engine.close)
             _print_traceback(self.error_stream)
-            raise WorkerError("model_load_failed", "音声生成モデルの読み込みに失敗しました。") from error
+            raise WorkerError(
+                "model_load_failed",
+                "音声生成モデルの読み込みに失敗しました。",
+                stage="load",
+            ) from error
 
         self.engine = engine
+        self.cache = PreparedVoiceCache(
+            generation,
+            max_entries=self.cache_max_entries,
+            max_bytes=self.cache_max_bytes,
+        )
         return engine
+
+    def _require_engine(self) -> Any:
+        if self.engine is None:
+            raise WorkerError(
+                "runtime_unavailable",
+                "先にpreloadを実行してください。",
+                stage="runtime",
+                reason="not_loaded",
+            )
+        return self.engine
+
+    def _require_cache(self) -> PreparedVoiceCache:
+        if self.cache is None:
+            raise WorkerError(
+                "runtime_unavailable",
+                "Prepared voice cacheを利用できません。",
+                stage="runtime",
+                reason="cache_unavailable",
+            )
+        if self.cache.runtime_generation != self._require_current_generation():
+            raise WorkerError(
+                "runtime_unavailable",
+                "Runtime generationとcache namespaceが一致しません。",
+                stage="runtime",
+                reason="cache_generation_mismatch",
+            )
+        return self.cache
+
+    def _require_current_generation(self) -> str:
+        generation = self.runtime_generation
+        if generation is None:
+            raise WorkerError(
+                "runtime_unavailable",
+                "Runtime generationを利用できません。",
+                stage="runtime",
+                reason="generation_unavailable",
+            )
+        return generation
+
+    def _validate_runtime_generation(
+        self,
+        request: dict[str, Any],
+        *,
+        required: bool,
+    ) -> str:
+        current = self._require_current_generation()
+        supplied = request.get("runtime_generation")
+        if supplied is None:
+            if required:
+                raise WorkerError(
+                    "invalid_request",
+                    "runtime_generationを指定してください。",
+                    stage="validation",
+                    reason="missing_runtime_generation",
+                )
+            return current
+        if not isinstance(supplied, str) or not supplied:
+            raise WorkerError(
+                "invalid_request",
+                "runtime_generationは空でない文字列にしてください。",
+                stage="validation",
+                reason="invalid_runtime_generation",
+            )
+        if supplied != current:
+            raise WorkerError(
+                "runtime_unavailable",
+                "runtime_generationが現在のRuntimeと一致しません。",
+                stage="runtime",
+                reason="runtime_generation_mismatch",
+            )
+        return current
+
+    def _log_cache_result(
+        self,
+        request_id: str,
+        acquisition: PreparedVoiceAcquisition,
+        duration: float,
+        revision: str,
+    ) -> None:
+        cache = self._require_cache()
+        event = "cache_hit" if acquisition.cache_hit else "cache_miss"
+        self._log(
+            request_id,
+            event,
+            runtime_generation=cache.runtime_generation,
+            reference_revision=revision[:12],
+            prepare_ms=round(duration * 1000.0, 1),
+            entries=cache.entry_count,
+            estimated_bytes=cache.estimated_bytes,
+            evicted=acquisition.evicted_count,
+            coalesced_waiters=acquisition.coalesced_waiters,
+            cached=acquisition.cached,
+        )
+        if not acquisition.cached:
+            self._log(
+                request_id,
+                "capacity_exceeded_uncached",
+                prepared_bytes=acquisition.estimated_bytes,
+            )
+        if acquisition.evicted_count:
+            self._log(request_id, "eviction", count=acquisition.evicted_count)
 
     def _write_response(self, response: dict[str, Any]) -> None:
         self.output_stream.write(json.dumps(response, ensure_ascii=False) + "\n")
         self.output_stream.flush()
 
-    def _log(self, request_id: str, event: str) -> None:
-        print(f"[local_worker] id={request_id} event={event}", file=self.error_stream)
+    def _log(self, request_id: str, event: str, **details: Any) -> None:
+        suffix = "".join(f" {key}={value}" for key, value in details.items())
+        print(
+            f"[local_worker] id={request_id} event={event}{suffix}",
+            file=self.error_stream,
+        )
 
 
 def run_worker(
@@ -192,19 +715,32 @@ def run_worker(
     error_stream: TextIO,
     *,
     engine_factory: EngineFactory | None = None,
+    cache_max_entries: int = DEFAULT_MAX_CACHE_ENTRIES,
+    cache_max_bytes: int = DEFAULT_MAX_CACHE_BYTES,
+    max_reference_bytes: int = DEFAULT_MAX_REFERENCE_BYTES,
 ) -> None:
+    """Execute already-sent JSON requests sequentially on one worker lane."""
     worker = LocalWorker(
         output_stream=output_stream,
         error_stream=error_stream,
         engine_factory=engine_factory or VoiceEngine,
+        cache_max_entries=cache_max_entries,
+        cache_max_bytes=cache_max_bytes,
+        max_reference_bytes=max_reference_bytes,
     )
 
-    for line in input_stream:
-        if line.strip() == "":
-            continue
-        should_continue = worker.process_line(line)
-        if not should_continue:
-            break
+    try:
+        for line in input_stream:
+            if line.strip() == "":
+                continue
+            should_continue = worker.process_line(line)
+            if not should_continue:
+                break
+    finally:
+        try:
+            worker.close()
+        except Exception:
+            _print_traceback(error_stream)
 
 
 def main() -> None:
@@ -255,7 +791,7 @@ def _validate_reference_audio(value: Any) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise WorkerError("missing_reference", "reference_audioを指定してください。")
 
-    path = Path(value).expanduser().resolve(strict=False)
+    path = Path(value).resolve(strict=False)
     if not path.is_file():
         raise WorkerError("missing_reference", "参照音声ファイルが見つかりません。")
     return path
@@ -267,11 +803,182 @@ def _validate_optional_reference_audio(value: Any) -> Path | None:
     return _validate_reference_audio(value)
 
 
+def _validate_reference_request(
+    value: Any,
+    *,
+    default_preprocessing: ReferencePreprocessing | None = None,
+) -> _ReferenceRequest:
+    if not isinstance(value, dict):
+        raise WorkerError(
+            "invalid_reference",
+            "referenceはJSON objectにしてください。",
+            stage="validation",
+            reason="invalid_reference_object",
+        )
+    unknown = set(value) - {"files", "preprocessing"}
+    if unknown:
+        raise WorkerError(
+            "invalid_reference",
+            "referenceに未対応fieldがあります。",
+            stage="validation",
+            reason="unknown_reference_field",
+        )
+    files = value.get("files")
+    if not isinstance(files, list) or len(files) != 1:
+        raise WorkerError(
+            "invalid_reference",
+            "v3 reference.filesには1つのpathを指定してください。",
+            stage="validation",
+            reason="file_count",
+        )
+    raw_path = files[0]
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise WorkerError(
+            "invalid_reference",
+            "reference file pathは空でない文字列にしてください。",
+            stage="validation",
+            reason="invalid_path",
+        )
+    path = Path(raw_path).resolve(strict=False)
+    preprocessing = (
+        default_preprocessing
+        if "preprocessing" not in value and default_preprocessing is not None
+        else _validate_preprocessing(value.get("preprocessing", {}))
+    )
+    return _ReferenceRequest(path=path, preprocessing=preprocessing)
+
+
+def _validate_preprocessing(value: Any) -> ReferencePreprocessing:
+    if not isinstance(value, dict):
+        raise WorkerError(
+            "invalid_reference",
+            "reference.preprocessingはJSON objectにしてください。",
+            stage="validation",
+            reason="invalid_preprocessing",
+        )
+    unknown = set(value) - _PREPROCESSING_FIELDS
+    if unknown:
+        raise WorkerError(
+            "invalid_reference",
+            "reference.preprocessingに未対応fieldがあります。",
+            stage="validation",
+            reason="unknown_preprocessing_field",
+        )
+    normalize_db = value.get("ref_normalize_db", -16.0)
+    ensure_max = value.get("ref_ensure_max", True)
+    max_seconds = value.get("max_ref_seconds", 30.0)
+    if normalize_db is not None and (
+        not isinstance(normalize_db, (int, float)) or isinstance(normalize_db, bool)
+    ):
+        raise _invalid_preprocessing_value("ref_normalize_db")
+    if not isinstance(ensure_max, bool):
+        raise _invalid_preprocessing_value("ref_ensure_max")
+    if max_seconds is not None and (
+        not isinstance(max_seconds, (int, float)) or isinstance(max_seconds, bool)
+    ):
+        raise _invalid_preprocessing_value("max_ref_seconds")
+    try:
+        return ReferencePreprocessing(
+            ref_normalize_db=None if normalize_db is None else float(normalize_db),
+            ref_ensure_max=ensure_max,
+            max_ref_seconds=None if max_seconds is None else float(max_seconds),
+        )
+    except ValueError as error:
+        raise WorkerError(
+            "invalid_reference",
+            "reference.preprocessingの値が不正です。",
+            stage="validation",
+            reason="invalid_preprocessing_value",
+        ) from error
+
+
+def _invalid_preprocessing_value(name: str) -> WorkerError:
+    return WorkerError(
+        "invalid_reference",
+        f"{name}の型が不正です。",
+        stage="validation",
+        reason="invalid_preprocessing_value",
+    )
+
+
+def _preprocessing_from_settings(settings: VoiceGenerationSettings) -> ReferencePreprocessing:
+    return ReferencePreprocessing(
+        ref_normalize_db=settings.ref_normalize_db,
+        ref_ensure_max=settings.ref_ensure_max,
+        max_ref_seconds=settings.max_ref_seconds,
+    )
+
+
+def _reject_conflicting_preprocessing(
+    reference: dict[str, Any],
+    settings_payload: dict[str, Any],
+    reference_preprocessing: ReferencePreprocessing,
+    settings_preprocessing: ReferencePreprocessing,
+) -> None:
+    if "preprocessing" not in reference:
+        return
+    for name in _PREPROCESSING_FIELDS.intersection(settings_payload):
+        if getattr(reference_preprocessing, name) != getattr(settings_preprocessing, name):
+            raise _contradictory("conflicting_reference_preprocessing")
+
+
+def _validate_prepared_voice_id(value: Any) -> str:
+    if not isinstance(value, str) or _HANDLE_PATTERN.fullmatch(value) is None:
+        raise WorkerError(
+            "invalid_handle",
+            "prepared_voice_idの形式が正しくありません。",
+            stage="handle_resolution",
+            reason="malformed",
+        )
+    return value
+
+
+def _validate_reference_revision(value: Any) -> str:
+    if not isinstance(value, str) or _REVISION_PATTERN.fullmatch(value) is None:
+        raise WorkerError(
+            "invalid_reference",
+            "reference_revisionの形式が正しくありません。",
+            stage="fallback",
+            reason="invalid_revision",
+        )
+    return value
+
+
+def _validate_no_ref(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise WorkerError(
+            "invalid_request",
+            "no_refはbooleanにしてください。",
+            stage="validation",
+            reason="invalid_no_ref",
+        )
+    return value
+
+
+def _contradictory(reason: str) -> WorkerError:
+    return WorkerError(
+        "invalid_request",
+        "矛盾する音声conditioning指定です。",
+        stage="validation",
+        reason=reason,
+    )
+
+
+def _reject_same_reference_and_output(reference: Path, output: Path) -> None:
+    if reference == output:
+        raise WorkerError(
+            "invalid_request",
+            "参照音声と出力先には別のfileを指定してください。",
+            stage="validation",
+            reason="reference_is_output",
+        )
+
+
 def _validate_output_path(value: Any) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise WorkerError("invalid_request", "output_pathを指定してください。")
 
-    path = Path(value).expanduser().resolve(strict=False)
+    path = Path(value).resolve(strict=False)
     if path.exists() and path.is_dir():
         raise WorkerError("invalid_request", "output_pathはfile pathを指定してください。")
     if not path.name:
@@ -283,7 +990,7 @@ def _validate_output_dir(value: Any) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise WorkerError("invalid_request", "output_dirを指定してください。")
 
-    path = Path(value).expanduser().resolve(strict=False)
+    path = Path(value).resolve(strict=False)
     if path.exists() and not path.is_dir():
         raise WorkerError("invalid_request", "output_dirはdirectory pathを指定してください。")
     return path
@@ -318,7 +1025,15 @@ def _validate_settings(value: Any) -> VoiceGenerationSettings:
                 raise WorkerError("invalid_settings", f"{key}はnumberにしてください。")
             coerced[key] = float(raw_value)
 
-    return VoiceGenerationSettings(**coerced)
+    settings = VoiceGenerationSettings(**coerced)
+    try:
+        _preprocessing_from_settings(settings)
+    except ValueError as error:
+        raise WorkerError(
+            "invalid_settings",
+            "参照音声preprocessing settingsの値が不正です。",
+        ) from error
+    return settings
 
 
 def _redirect_stdout_to_stderr(
@@ -331,15 +1046,20 @@ def _redirect_stdout_to_stderr(
         return func(*args, **kwargs)
 
 
-def _error_response(request_id: Any, code: str, message: str) -> dict[str, Any]:
-    return {
-        "id": request_id,
-        "ok": False,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    }
+def _error_response(
+    request_id: Any,
+    code: str,
+    message: str,
+    *,
+    stage: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if stage is not None:
+        error["stage"] = stage
+    if reason is not None:
+        error["reason"] = reason
+    return {"id": request_id, "ok": False, "error": error}
 
 
 def _looks_like_cuda_error(error: BaseException) -> bool:

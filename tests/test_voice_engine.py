@@ -6,21 +6,41 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
+from irodori_tts.inference_runtime import PreparedReferenceConditioning
+from irodori_tts.prepared_voice_cache import ReferencePreprocessing
 from voice_engine import VoiceEngine, VoiceGenerationResult, VoiceGenerationSettings
 
 
 class FakeRuntime:
     def __init__(self) -> None:
         self.requests = []
+        self.prepared_references = []
+        self.prepare_calls = []
+        self.runtime_generation = "runtime-generation"
+        self.unload_count = 0
 
-    def synthesize(self, request, log_fn=None):
+    def synthesize(self, request, log_fn=None, prepared_reference=None):
         self.requests.append(request)
+        self.prepared_references.append(prepared_reference)
         return SimpleNamespace(
             audio=b"dummy audio",
             sample_rate=24000,
             used_seed=1234,
             total_to_decode=0.123,
         )
+
+    def prepare_reference_conditioning(self, **kwargs):
+        self.prepare_calls.append(kwargs)
+        return PreparedReferenceConditioning(
+            torch.zeros((1, 2, 2)),
+            torch.ones((1, 2), dtype=torch.bool),
+            _lora_adapter=None,
+        )
+
+    def unload(self) -> None:
+        self.unload_count += 1
 
 
 class VoiceEngineLoadTest(unittest.TestCase):
@@ -316,6 +336,79 @@ class VoiceEngineGenerateTest(unittest.TestCase):
             self.assertEqual(save.call_args.args[0].parent, base_dir / "outputs")
             self.assertTrue(save.call_args.args[0].name.startswith("voice_"))
             self.assertEqual(save.call_args.args[0].suffix, ".wav")
+
+    def test_prepare_uses_exact_snapshot_and_preprocessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = FakeRuntime()
+            engine = VoiceEngine(None, Path(temp_dir) / "outputs")
+            engine._runtime = runtime
+            preprocessing = ReferencePreprocessing(
+                ref_normalize_db=-12.0,
+                ref_ensure_max=False,
+                max_ref_seconds=12.5,
+            )
+
+            prepared = engine.prepare_reference_conditioning(
+                b"immutable",
+                ref_normalize_db=preprocessing.ref_normalize_db,
+                ref_ensure_max=preprocessing.ref_ensure_max,
+                max_ref_seconds=preprocessing.max_ref_seconds,
+            )
+
+        self.assertIsInstance(prepared, PreparedReferenceConditioning)
+        self.assertEqual(runtime.prepare_calls[0]["ref_wav_bytes"], b"immutable")
+        self.assertEqual(runtime.prepare_calls[0]["ref_normalize_db"], -12.0)
+        self.assertFalse(runtime.prepare_calls[0]["ref_ensure_max"])
+        self.assertEqual(runtime.prepare_calls[0]["max_ref_seconds"], 12.5)
+
+    def test_generate_with_prepared_never_injects_default_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            default_audio = self._write_audio(base_dir / "default.wav")
+            runtime = FakeRuntime()
+            engine = VoiceEngine(default_audio, base_dir / "outputs")
+            engine._runtime = runtime
+            prepared = runtime.prepare_reference_conditioning(ref_wav_bytes=b"snapshot")
+
+            with patch(
+                "irodori_tts.voice_engine.save_wav",
+                return_value=base_dir / "generated.wav",
+            ):
+                engine.generate_with_prepared("こんにちは", prepared)
+
+        self.assertIsNone(runtime.requests[0].ref_wav)
+        self.assertFalse(runtime.requests[0].no_ref)
+        self.assertIs(runtime.prepared_references[0], prepared)
+
+    def test_no_ref_path_has_no_reference_or_prepared_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            runtime = FakeRuntime()
+            engine = VoiceEngine(None, base_dir / "outputs")
+            engine._runtime = runtime
+
+            with patch(
+                "irodori_tts.voice_engine.save_wav",
+                return_value=base_dir / "generated.wav",
+            ):
+                engine.generate_no_ref("こんにちは")
+
+        self.assertTrue(runtime.requests[0].no_ref)
+        self.assertIsNone(runtime.requests[0].ref_wav)
+        self.assertIsNone(runtime.prepared_references[0])
+
+    def test_runtime_generation_and_close_bridge_runtime_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = FakeRuntime()
+            engine = VoiceEngine(None, Path(temp_dir) / "outputs")
+            engine._runtime = runtime
+
+            self.assertEqual(engine.runtime_generation, "runtime-generation")
+            engine.close()
+            engine.close()
+
+        self.assertEqual(runtime.unload_count, 1)
+        self.assertFalse(engine.is_loaded)
 
     def test_root_voice_engine_compatibility_imports_package_api(self) -> None:
         from irodori_tts.voice_engine import VoiceEngine as PackageVoiceEngine
