@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import torch
 
 from irodori_tts.inference_runtime import PreparedReferenceConditioning
 from irodori_tts.local_worker import LocalWorker, run_worker
 from irodori_tts.prepared_voice_cache import (
+    CacheClosedError,
+    PreparedVoiceCache,
     ReferencePreprocessing,
     snapshot_reference_file,
 )
@@ -237,19 +241,205 @@ class LocalWorkerPreparedVoiceProtocolTest(unittest.TestCase):
             )
             reference.unlink()
 
-            generated = harness.request(
-                self._generate(
-                    base / "reply.wav",
-                    runtime_generation=generation,
-                    prepared_voice_id=prepared["prepared_voice_id"],
-                    reference=self._reference(reference),
-                    reference_revision=prepared["reference_revision"],
+            with patch(
+                "irodori_tts.local_worker.snapshot_reference_file",
+                side_effect=AssertionError("resident handle reread its fallback reference"),
+            ) as snapshot:
+                generated = harness.request(
+                    self._generate(
+                        base / "reply.wav",
+                        runtime_generation=generation,
+                        prepared_voice_id=prepared["prepared_voice_id"],
+                        reference=self._reference(reference),
+                        reference_revision=prepared["reference_revision"],
+                    )
                 )
-            )
 
         self.assertTrue(generated["ok"])
         self.assertTrue(generated["cache_hit"])
+        snapshot.assert_not_called()
         self.assertEqual(len(_PreparedFakeEngine.instances[0].prepare_calls), 1)
+
+    def test_resident_handle_rejects_direct_and_normalized_reference_output_collisions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            reference.write_bytes(b"resident")
+            harness = _Harness()
+            generation = harness.preload(base / "outputs")["runtime_generation"]
+            prepared = harness.request(
+                {
+                    "id": "prepare",
+                    "type": "prepare_voice",
+                    "runtime_generation": generation,
+                    "reference": self._reference(reference),
+                }
+            )
+            engine = _PreparedFakeEngine.instances[0]
+            engine.generate_calls.clear()
+
+            with patch(
+                "irodori_tts.local_worker.snapshot_reference_file",
+                side_effect=AssertionError("collision validation read the reference"),
+            ) as snapshot:
+                direct = harness.request(
+                    self._generate(
+                        reference,
+                        runtime_generation=generation,
+                        prepared_voice_id=prepared["prepared_voice_id"],
+                        reference=self._reference(reference),
+                        reference_revision=prepared["reference_revision"],
+                    )
+                )
+                normalized = harness.request(
+                    self._generate(
+                        base / "unused" / ".." / reference.name,
+                        runtime_generation=generation,
+                        prepared_voice_id=prepared["prepared_voice_id"],
+                        reference=self._reference(reference),
+                        reference_revision=prepared["reference_revision"],
+                    )
+                )
+
+        for response in (direct, normalized):
+            self.assertEqual(response["error"]["code"], "invalid_request")
+            self.assertEqual(response["error"]["reason"], "reference_is_output")
+        snapshot.assert_not_called()
+        self.assertEqual(engine.generate_calls, [])
+
+    def test_stale_fallback_and_reference_only_collisions_are_rejected_before_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            reference.write_bytes(b"fallback")
+            revision = snapshot_reference_file(reference, ReferencePreprocessing()).revision
+            harness = _Harness()
+            generation = harness.preload(base / "outputs")["runtime_generation"]
+            engine = _PreparedFakeEngine.instances[0]
+
+            with patch(
+                "irodori_tts.local_worker.snapshot_reference_file",
+                side_effect=AssertionError("collision validation read the reference"),
+            ) as snapshot:
+                stale = harness.request(
+                    self._generate(
+                        reference,
+                        runtime_generation=generation,
+                        prepared_voice_id="f" * 32,
+                        reference=self._reference(reference),
+                        reference_revision=revision,
+                    )
+                )
+                reference_only = harness.request(
+                    self._generate(reference, reference=self._reference(reference))
+                )
+
+        for response in (stale, reference_only):
+            self.assertEqual(response["error"]["code"], "invalid_request")
+            self.assertEqual(response["error"]["reason"], "reference_is_output")
+        snapshot.assert_not_called()
+        self.assertEqual(engine.prepare_calls, [])
+        self.assertEqual(engine.generate_calls, [])
+
+    def test_protocol_paths_expand_home_for_legacy_b2_output_and_preload_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            home.mkdir()
+            legacy_reference = home / "legacy.wav"
+            b2_reference = home / "b2.wav"
+            legacy_reference.write_bytes(b"legacy")
+            b2_reference.write_bytes(b"b2")
+            with patch.dict(
+                os.environ,
+                {"HOME": str(home), "USERPROFILE": str(home)},
+            ):
+                legacy = _Harness()
+                legacy_response = legacy.request(
+                    self._generate(
+                        Path("~/legacy-output.wav"),
+                        reference_audio="~/legacy.wav",
+                    )
+                )
+                b2 = _Harness()
+                with patch(
+                    "irodori_tts.local_worker.snapshot_reference_file",
+                    wraps=snapshot_reference_file,
+                ) as snapshot:
+                    b2_response = b2.request(
+                        self._generate(
+                            Path("~/b2-output.wav"),
+                            reference=self._reference(Path("~/b2.wav")),
+                        )
+                    )
+                preload = _Harness()
+                preload_response = preload.preload(Path("~/outputs"))
+
+        self.assertTrue(legacy_response["ok"])
+        self.assertEqual(
+            _PreparedFakeEngine.instances[0].reference_audio, legacy_reference.resolve()
+        )
+        self.assertEqual(
+            _PreparedFakeEngine.instances[0].generate_calls[0]["output_path"],
+            (home / "legacy-output.wav").resolve(),
+        )
+        self.assertTrue(b2_response["ok"])
+        self.assertEqual(snapshot.call_args.args[0], b2_reference.resolve())
+        self.assertEqual(
+            _PreparedFakeEngine.instances[1].generate_calls[0]["output_path"],
+            (home / "b2-output.wav").resolve(),
+        )
+        self.assertTrue(preload_response["ok"])
+        self.assertEqual(_PreparedFakeEngine.instances[2].output_dir, (home / "outputs").resolve())
+
+    def test_absolute_and_relative_protocol_paths_keep_resolve_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            reference.write_bytes(b"audio")
+            absolute = _Harness()
+            absolute_response = absolute.request(
+                self._generate(base / "absolute.wav", reference_audio=str(reference))
+            )
+            relative_reference = os.path.relpath(reference, Path.cwd())
+            relative_output = os.path.relpath(base / "relative.wav", Path.cwd())
+            relative = _Harness()
+            relative_response = relative.request(
+                self._generate(Path(relative_output), reference_audio=relative_reference)
+            )
+
+        self.assertTrue(absolute_response["ok"])
+        self.assertEqual(_PreparedFakeEngine.instances[0].reference_audio, reference.resolve())
+        self.assertEqual(
+            _PreparedFakeEngine.instances[0].generate_calls[0]["output_path"],
+            (base / "absolute.wav").resolve(),
+        )
+        self.assertTrue(relative_response["ok"])
+        self.assertEqual(_PreparedFakeEngine.instances[1].reference_audio, reference.resolve())
+        self.assertEqual(
+            _PreparedFakeEngine.instances[1].generate_calls[0]["output_path"],
+            (base / "relative.wav").resolve(),
+        )
+
+    def test_home_expanded_collision_is_rejected_consistently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            home.mkdir()
+            reference = home / "voice.wav"
+            reference.write_bytes(b"audio")
+            harness = _Harness()
+            with patch.dict(
+                os.environ,
+                {"HOME": str(home), "USERPROFILE": str(home)},
+            ):
+                response = harness.request(
+                    self._generate(reference, reference=self._reference(Path("~/voice.wav")))
+                )
+
+        self.assertEqual(response["error"]["code"], "invalid_request")
+        self.assertEqual(response["error"]["reason"], "reference_is_output")
+        self.assertEqual(_PreparedFakeEngine.instances, [])
 
     def test_stale_handle_fallback_prepares_and_synthesizes_exactly_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -498,14 +688,96 @@ class LocalWorkerPreparedVoiceProtocolTest(unittest.TestCase):
                     "reference": self._reference(reference),
                 }
             )
+            cache = harness.worker.cache
+            engine = _PreparedFakeEngine.instances[0]
+            events = []
+            original_cache_close = cache.close
+            original_engine_close = engine.close
+
+            def close_cache() -> None:
+                events.append("cache")
+                original_cache_close()
+
+            def close_engine() -> None:
+                events.append("engine")
+                original_engine_close()
+
+            cache.close = close_cache
+            engine.close = close_engine
 
             response = harness.request({"id": "shutdown", "type": "shutdown"})
             harness.worker.close()
 
         stderr = harness.error.getvalue()
         self.assertTrue(response["ok"])
+        self.assertEqual(events, ["cache", "engine"])
         self.assertLess(stderr.index("event=cache_close"), stderr.index("event=engine_close"))
         self.assertEqual(_PreparedFakeEngine.instances[0].close_count, 1)
+
+    def test_broken_stderr_does_not_skip_cache_or_engine_cleanup(self) -> None:
+        class _BrokenError(io.StringIO):
+            def write(self, value):
+                raise OSError("controlled diagnostic failure")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            reference.write_bytes(b"voice")
+            harness = _Harness()
+            generation = harness.preload(base / "outputs")["runtime_generation"]
+            prepared = harness.request(
+                {
+                    "id": "prepare",
+                    "type": "prepare_voice",
+                    "runtime_generation": generation,
+                    "reference": self._reference(reference),
+                }
+            )
+            cache = harness.worker.cache
+            engine = _PreparedFakeEngine.instances[0]
+            harness.worker.error_stream = _BrokenError()
+
+            harness.worker.close()
+            harness.worker.close()
+
+        self.assertEqual(engine.close_count, 1)
+        self.assertEqual(cache.entry_count, 0)
+        with self.assertRaises(CacheClosedError):
+            cache.acquire_handle(prepared["prepared_voice_id"])
+
+    def test_cache_close_failure_still_attempts_engine_close_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            harness = _Harness()
+            harness.preload(Path(temp_dir) / "outputs")
+            cache = harness.worker.cache
+            engine = _PreparedFakeEngine.instances[0]
+            cache.close = Mock(side_effect=RuntimeError("cache cleanup failed"))
+
+            with self.assertRaisesRegex(RuntimeError, "cache cleanup failed"):
+                harness.worker.close()
+            harness.worker.close()
+
+        cache.close.assert_called_once_with()
+        self.assertEqual(engine.close_count, 1)
+        self.assertIsNone(harness.worker.cache)
+        self.assertIsNone(harness.worker.engine)
+
+    def test_engine_close_failure_keeps_terminal_bookkeeping_coherent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            harness = _Harness()
+            harness.preload(Path(temp_dir) / "outputs")
+            cache = harness.worker.cache
+            engine = _PreparedFakeEngine.instances[0]
+            engine.close = Mock(side_effect=RuntimeError("engine cleanup failed"))
+
+            with self.assertRaisesRegex(RuntimeError, "engine cleanup failed"):
+                harness.worker.close()
+            harness.worker.close()
+
+        engine.close.assert_called_once_with()
+        self.assertEqual(cache.entry_count, 0)
+        self.assertIsNone(harness.worker.cache)
+        self.assertIsNone(harness.worker.engine)
 
     def test_worker_restart_uses_new_generation_and_eof_style_close_invalidates_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -551,7 +823,21 @@ class LocalWorkerPreparedVoiceProtocolTest(unittest.TestCase):
             def write(self, value):
                 raise OSError("controlled protocol failure")
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        closed_caches = []
+        original_cache_close = PreparedVoiceCache.close
+
+        def tracked_cache_close(cache) -> None:
+            original_cache_close(cache)
+            closed_caches.append(cache)
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(
+                PreparedVoiceCache,
+                "close",
+                tracked_cache_close,
+            ),
+        ):
             request = json.dumps(
                 {
                     "id": "preload",
@@ -568,6 +854,42 @@ class LocalWorkerPreparedVoiceProtocolTest(unittest.TestCase):
                 )
 
         self.assertEqual(_PreparedFakeEngine.instances[0].close_count, 1)
+        self.assertEqual(len(closed_caches), 1)
+        self.assertEqual(closed_caches[0].entry_count, 0)
+
+    def test_eof_finally_closes_cache_and_engine(self) -> None:
+        closed_caches = []
+        original_cache_close = PreparedVoiceCache.close
+
+        def tracked_cache_close(cache) -> None:
+            original_cache_close(cache)
+            closed_caches.append(cache)
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(
+                PreparedVoiceCache,
+                "close",
+                tracked_cache_close,
+            ),
+        ):
+            request = json.dumps(
+                {
+                    "id": "preload",
+                    "type": "preload",
+                    "output_dir": str(Path(temp_dir) / "outputs"),
+                }
+            )
+            run_worker(
+                io.StringIO(request + "\n"),
+                io.StringIO(),
+                io.StringIO(),
+                engine_factory=_PreparedFakeEngine,
+            )
+
+        self.assertEqual(_PreparedFakeEngine.instances[0].close_count, 1)
+        self.assertEqual(len(closed_caches), 1)
+        self.assertEqual(closed_caches[0].entry_count, 0)
 
 
 if __name__ == "__main__":

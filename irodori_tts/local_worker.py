@@ -6,7 +6,7 @@ import re
 import sys
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -141,21 +141,33 @@ class LocalWorker:
         self._closed = True
         cache = self.cache
         self.cache = None
+        engine = self.engine
+        self.engine = None
+        cleanup_errors: list[BaseException] = []
         if cache is not None:
-            entries = cache.entry_count
-            estimated_bytes = cache.estimated_bytes
-            cache.close()
-            self._log(
+            entries = None
+            estimated_bytes = None
+            with contextlib.suppress(Exception):
+                entries = cache.entry_count
+                estimated_bytes = cache.estimated_bytes
+            try:
+                cache.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            self._log_best_effort(
                 "worker",
                 "cache_close",
                 entries=entries,
                 estimated_bytes=estimated_bytes,
             )
-        engine = self.engine
-        self.engine = None
         if engine is not None:
-            _redirect_stdout_to_stderr(self.error_stream, engine.close)
-            self._log("worker", "engine_close")
+            try:
+                _redirect_stdout_to_stderr(self.error_stream, engine.close)
+            except BaseException as error:
+                cleanup_errors.append(error)
+            self._log_best_effort("worker", "engine_close")
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     def _handle_request(self, request: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         request_id = _validate_request_id(request.get("id"))
@@ -278,13 +290,6 @@ class LocalWorker:
             raise _contradictory("unexpected_reference_revision")
         if has_handle and has_reference and "reference_revision" not in request:
             raise _contradictory("missing_reference_revision")
-        fallback_revision = (
-            _validate_reference_revision(request.get("reference_revision"))
-            if has_handle and has_reference
-            else None
-        )
-        handle = _validate_prepared_voice_id(raw_handle) if has_handle else None
-
         reference = None
         if has_reference:
             settings_preprocessing = _preprocessing_from_settings(settings)
@@ -300,10 +305,22 @@ class LocalWorker:
             )
         elif has_legacy_reference:
             reference = _ReferenceRequest(
-                path=_validate_reference_audio(request["reference_audio"]),
+                path=_validate_reference_audio_path(request["reference_audio"]),
                 preprocessing=_preprocessing_from_settings(settings),
                 legacy=True,
             )
+
+        if reference is not None:
+            _reject_reference_output_collisions((reference.path,), output_path)
+            if reference.legacy:
+                _require_reference_audio_file(reference.path)
+
+        fallback_revision = (
+            _validate_reference_revision(request.get("reference_revision"))
+            if has_handle and has_reference
+            else None
+        )
+        handle = _validate_prepared_voice_id(raw_handle) if has_handle else None
 
         self._log(request_id, "generate_start", runtime_generation=self.runtime_generation)
         engine = (
@@ -362,7 +379,6 @@ class LocalWorker:
                         stage="handle_resolution",
                         reason="not_resident",
                     ) from None
-                _reject_same_reference_and_output(reference.path, output_path)
                 snapshot = self._snapshot(reference)
                 if snapshot.revision != fallback_revision:
                     raise WorkerError(
@@ -385,7 +401,6 @@ class LocalWorker:
         else:
             if reference is None:  # pragma: no cover - guarded above
                 raise CacheInvariantError("Reference form was lost after validation.")
-            _reject_same_reference_and_output(reference.path, output_path)
             snapshot = self._snapshot(reference)
             acquisition, duration = self._prepare_snapshot(engine, snapshot)
             self._log_cache_result(request_id, acquisition, duration, snapshot.revision)
@@ -708,6 +723,10 @@ class LocalWorker:
             file=self.error_stream,
         )
 
+    def _log_best_effort(self, request_id: str, event: str, **details: Any) -> None:
+        with contextlib.suppress(Exception):
+            self._log(request_id, event, **details)
+
 
 def run_worker(
     input_stream: TextIO,
@@ -788,13 +807,20 @@ def _validate_text(value: Any) -> str:
 
 
 def _validate_reference_audio(value: Any) -> Path:
+    path = _validate_reference_audio_path(value)
+    _require_reference_audio_file(path)
+    return path
+
+
+def _validate_reference_audio_path(value: Any) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise WorkerError("missing_reference", "reference_audioを指定してください。")
+    return _resolve_protocol_path(value)
 
-    path = Path(value).resolve(strict=False)
+
+def _require_reference_audio_file(path: Path) -> None:
     if not path.is_file():
         raise WorkerError("missing_reference", "参照音声ファイルが見つかりません。")
-    return path
 
 
 def _validate_optional_reference_audio(value: Any) -> Path | None:
@@ -839,7 +865,7 @@ def _validate_reference_request(
             stage="validation",
             reason="invalid_path",
         )
-    path = Path(raw_path).resolve(strict=False)
+    path = _resolve_protocol_path(raw_path)
     preprocessing = (
         default_preprocessing
         if "preprocessing" not in value and default_preprocessing is not None
@@ -964,21 +990,22 @@ def _contradictory(reason: str) -> WorkerError:
     )
 
 
-def _reject_same_reference_and_output(reference: Path, output: Path) -> None:
-    if reference == output:
-        raise WorkerError(
-            "invalid_request",
-            "参照音声と出力先には別のfileを指定してください。",
-            stage="validation",
-            reason="reference_is_output",
-        )
+def _reject_reference_output_collisions(references: Iterable[Path], output: Path) -> None:
+    for reference in references:
+        if reference == output:
+            raise WorkerError(
+                "invalid_request",
+                "参照音声と出力先には別のfileを指定してください。",
+                stage="validation",
+                reason="reference_is_output",
+            )
 
 
 def _validate_output_path(value: Any) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise WorkerError("invalid_request", "output_pathを指定してください。")
 
-    path = Path(value).resolve(strict=False)
+    path = _resolve_protocol_path(value)
     if path.exists() and path.is_dir():
         raise WorkerError("invalid_request", "output_pathはfile pathを指定してください。")
     if not path.name:
@@ -990,10 +1017,14 @@ def _validate_output_dir(value: Any) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise WorkerError("invalid_request", "output_dirを指定してください。")
 
-    path = Path(value).resolve(strict=False)
+    path = _resolve_protocol_path(value)
     if path.exists() and not path.is_dir():
         raise WorkerError("invalid_request", "output_dirはdirectory pathを指定してください。")
     return path
+
+
+def _resolve_protocol_path(value: str) -> Path:
+    return Path(value).expanduser().resolve(strict=False)
 
 
 def _validate_settings(value: Any) -> VoiceGenerationSettings:
@@ -1088,7 +1119,8 @@ def _safe_error_message(error: BaseException) -> str:
 
 
 def _print_traceback(error_stream: TextIO) -> None:
-    traceback.print_exc(file=error_stream)
+    with contextlib.suppress(Exception):
+        traceback.print_exc(file=error_stream)
 
 
 if __name__ == "__main__":

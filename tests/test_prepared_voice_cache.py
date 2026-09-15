@@ -4,7 +4,9 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -57,6 +59,29 @@ class ReferenceRevisionTest(unittest.TestCase):
         self.assertEqual(
             reference_revision([b"audio"], negative, kind="audio_file"),
             reference_revision([b"audio"], explicit_none, kind="audio_file"),
+        )
+
+    def test_ensure_max_is_canonical_when_loudness_normalization_makes_it_ineffective(
+        self,
+    ) -> None:
+        enabled = ReferencePreprocessing(ref_normalize_db=-16.0, ref_ensure_max=True)
+        disabled = ReferencePreprocessing(ref_normalize_db=-16.0, ref_ensure_max=False)
+
+        self.assertEqual(enabled, disabled)
+        self.assertFalse(enabled.ref_ensure_max)
+        self.assertEqual(
+            reference_revision([b"audio"], enabled, kind="audio_file"),
+            reference_revision([b"audio"], disabled, kind="audio_file"),
+        )
+
+    def test_ensure_max_remains_part_of_identity_without_loudness_normalization(self) -> None:
+        enabled = ReferencePreprocessing(ref_normalize_db=None, ref_ensure_max=True)
+        disabled = ReferencePreprocessing(ref_normalize_db=None, ref_ensure_max=False)
+
+        self.assertNotEqual(enabled, disabled)
+        self.assertNotEqual(
+            reference_revision([b"audio"], enabled, kind="audio_file"),
+            reference_revision([b"audio"], disabled, kind="audio_file"),
         )
 
     def test_ordered_content_hashes_preserve_future_multi_reference_order(self) -> None:
@@ -195,17 +220,19 @@ class PreparedVoiceCacheTest(unittest.TestCase):
         self.assertIs(active.speaker_state, original_state)
 
     def test_shared_tensor_storage_is_not_double_counted(self) -> None:
-        state = torch.zeros((1, 3, 4), dtype=torch.float32)
+        storage = torch.zeros(48, dtype=torch.uint8)
+        state = storage.view(torch.float32).view(1, 3, 4)
+        mask = storage[:3].view(torch.bool).view(1, 3)
+        mask.fill_(True)
         prepared = PreparedReferenceConditioning(
             speaker_state=state,
-            speaker_mask=torch.ones((1, 3), dtype=torch.bool),
+            speaker_mask=mask,
             _lora_adapter=None,
         )
-        prepared.__dict__["another_view"] = state.view(1, 3, 4)
 
         self.assertEqual(
             estimate_prepared_bytes(prepared),
-            state.untyped_storage().nbytes() + prepared.speaker_mask.untyped_storage().nbytes(),
+            storage.untyped_storage().nbytes(),
         )
 
     def test_same_key_concurrent_prepare_is_single_flight(self) -> None:
@@ -213,8 +240,14 @@ class PreparedVoiceCacheTest(unittest.TestCase):
         key = cache.cache_key("a" * 64)
         leader_started = threading.Event()
         release_leader = threading.Event()
+        waiter_joined = threading.Event()
         calls = 0
         results = []
+
+        class _ObservedFuture(Future):
+            def result(self, timeout=None):
+                waiter_joined.set()
+                return super().result(timeout=timeout)
 
         def prepare() -> PreparedReferenceConditioning:
             nonlocal calls
@@ -226,15 +259,21 @@ class PreparedVoiceCacheTest(unittest.TestCase):
         def participant() -> None:
             results.append(cache.get_or_prepare(key, prepare))
 
-        leader = threading.Thread(target=participant)
-        waiter = threading.Thread(target=participant)
-        leader.start()
-        self.assertTrue(leader_started.wait(timeout=5))
-        waiter.start()
-        release_leader.set()
-        leader.join(timeout=5)
-        waiter.join(timeout=5)
+        with patch("irodori_tts.prepared_voice_cache.Future", _ObservedFuture):
+            leader = threading.Thread(target=participant)
+            waiter = threading.Thread(target=participant)
+            leader.start()
+            self.assertTrue(leader_started.wait(timeout=5))
+            waiter.start()
+            self.assertTrue(waiter_joined.wait(timeout=5))
+            self.assertTrue(leader.is_alive())
+            self.assertEqual(cache.in_flight_count, 1)
+            release_leader.set()
+            leader.join(timeout=5)
+            waiter.join(timeout=5)
 
+        self.assertFalse(leader.is_alive())
+        self.assertFalse(waiter.is_alive())
         self.assertEqual(calls, 1)
         self.assertEqual(len(results), 2)
         self.assertEqual(
@@ -247,7 +286,13 @@ class PreparedVoiceCacheTest(unittest.TestCase):
         key = cache.cache_key("a" * 64)
         leader_started = threading.Event()
         release_leader = threading.Event()
+        waiter_joined = threading.Event()
         errors = []
+
+        class _ObservedFuture(Future):
+            def result(self, timeout=None):
+                waiter_joined.set()
+                return super().result(timeout=timeout)
 
         def fail() -> PreparedReferenceConditioning:
             leader_started.set()
@@ -260,15 +305,21 @@ class PreparedVoiceCacheTest(unittest.TestCase):
             except Exception as error:  # noqa: BLE001 - asserting shared propagation
                 errors.append(error)
 
-        leader = threading.Thread(target=participant)
-        waiter = threading.Thread(target=participant)
-        leader.start()
-        self.assertTrue(leader_started.wait(timeout=5))
-        waiter.start()
-        release_leader.set()
-        leader.join(timeout=5)
-        waiter.join(timeout=5)
+        with patch("irodori_tts.prepared_voice_cache.Future", _ObservedFuture):
+            leader = threading.Thread(target=participant)
+            waiter = threading.Thread(target=participant)
+            leader.start()
+            self.assertTrue(leader_started.wait(timeout=5))
+            waiter.start()
+            self.assertTrue(waiter_joined.wait(timeout=5))
+            self.assertTrue(leader.is_alive())
+            self.assertEqual(cache.in_flight_count, 1)
+            release_leader.set()
+            leader.join(timeout=5)
+            waiter.join(timeout=5)
 
+        self.assertFalse(leader.is_alive())
+        self.assertFalse(waiter.is_alive())
         self.assertEqual(len(errors), 2)
         self.assertTrue(all(str(error) == "prepare failed" for error in errors))
         self.assertEqual(cache.in_flight_count, 0)

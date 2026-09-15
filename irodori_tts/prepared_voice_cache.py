@@ -58,6 +58,8 @@ class ReferencePreprocessing:
             object.__setattr__(self, "ref_normalize_db", 0.0 if normalized == 0 else normalized)
         if not isinstance(self.ref_ensure_max, bool):
             raise ValueError("ref_ensure_max must be boolean.")
+        if normalize_db is not None:
+            object.__setattr__(self, "ref_ensure_max", False)
         if max_seconds is not None:
             normalized_max = float(max_seconds)
             if not math.isfinite(normalized_max):
