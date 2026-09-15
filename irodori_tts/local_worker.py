@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import sys
 import time
@@ -49,7 +50,7 @@ _SETTINGS_TYPES: dict[str, type | tuple[type, ...]] = {
     "seed": int,
     "num_candidates": int,
     "decode_mode": str,
-    "ref_normalize_db": (int, float),
+    "ref_normalize_db": (int, float, type(None)),
     "ref_ensure_max": bool,
     "max_ref_seconds": (int, float),
 }
@@ -292,16 +293,10 @@ class LocalWorker:
             raise _contradictory("missing_reference_revision")
         reference = None
         if has_reference:
-            settings_preprocessing = _preprocessing_from_settings(settings)
             reference = _validate_reference_request(
                 request["reference"],
-                default_preprocessing=settings_preprocessing,
-            )
-            _reject_conflicting_preprocessing(
-                request["reference"],
-                settings_payload,
-                reference.preprocessing,
-                settings_preprocessing,
+                settings_payload=settings_payload,
+                settings=settings,
             )
         elif has_legacy_reference:
             reference = _ReferenceRequest(
@@ -832,7 +827,8 @@ def _validate_optional_reference_audio(value: Any) -> Path | None:
 def _validate_reference_request(
     value: Any,
     *,
-    default_preprocessing: ReferencePreprocessing | None = None,
+    settings_payload: dict[str, Any] | None = None,
+    settings: VoiceGenerationSettings | None = None,
 ) -> _ReferenceRequest:
     if not isinstance(value, dict):
         raise WorkerError(
@@ -866,15 +862,15 @@ def _validate_reference_request(
             reason="invalid_path",
         )
     path = _resolve_protocol_path(raw_path)
-    preprocessing = (
-        default_preprocessing
-        if "preprocessing" not in value and default_preprocessing is not None
-        else _validate_preprocessing(value.get("preprocessing", {}))
+    preprocessing = _effective_reference_preprocessing(
+        value,
+        settings_payload=settings_payload,
+        settings=settings,
     )
     return _ReferenceRequest(path=path, preprocessing=preprocessing)
 
 
-def _validate_preprocessing(value: Any) -> ReferencePreprocessing:
+def _validate_explicit_preprocessing(value: Any) -> dict[str, float | bool | None]:
     if not isinstance(value, dict):
         raise WorkerError(
             "invalid_reference",
@@ -890,25 +886,47 @@ def _validate_preprocessing(value: Any) -> ReferencePreprocessing:
             stage="validation",
             reason="unknown_preprocessing_field",
         )
-    normalize_db = value.get("ref_normalize_db", -16.0)
-    ensure_max = value.get("ref_ensure_max", True)
-    max_seconds = value.get("max_ref_seconds", 30.0)
-    if normalize_db is not None and (
-        not isinstance(normalize_db, (int, float)) or isinstance(normalize_db, bool)
-    ):
-        raise _invalid_preprocessing_value("ref_normalize_db")
-    if not isinstance(ensure_max, bool):
-        raise _invalid_preprocessing_value("ref_ensure_max")
-    if max_seconds is not None and (
-        not isinstance(max_seconds, (int, float)) or isinstance(max_seconds, bool)
-    ):
-        raise _invalid_preprocessing_value("max_ref_seconds")
+    validated: dict[str, float | bool | None] = {}
+    for name, raw_value in value.items():
+        if name == "ref_ensure_max":
+            if not isinstance(raw_value, bool):
+                raise _invalid_preprocessing_value(name)
+            validated[name] = raw_value
+        elif raw_value is None:
+            validated[name] = None
+        elif not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
+            raise _invalid_preprocessing_value(name)
+        else:
+            validated[name] = float(raw_value)
+    return validated
+
+
+def _effective_reference_preprocessing(
+    reference: dict[str, Any],
+    *,
+    settings_payload: dict[str, Any] | None,
+    settings: VoiceGenerationSettings | None,
+) -> ReferencePreprocessing:
+    """Merge raw request fields once, then canonicalize effective cache identity."""
+    explicit = _validate_explicit_preprocessing(reference.get("preprocessing", {}))
+    if settings is None:
+        merged: dict[str, float | bool | None] = {
+            "ref_normalize_db": -16.0,
+            "ref_ensure_max": True,
+            "max_ref_seconds": 30.0,
+        }
+    else:
+        merged = {
+            "ref_normalize_db": settings.ref_normalize_db,
+            "ref_ensure_max": settings.ref_ensure_max,
+            "max_ref_seconds": settings.max_ref_seconds,
+        }
+        for name in explicit.keys() & (settings_payload or {}).keys():
+            if explicit[name] != getattr(settings, name):
+                raise _contradictory("conflicting_reference_preprocessing")
+    merged.update(explicit)
     try:
-        return ReferencePreprocessing(
-            ref_normalize_db=None if normalize_db is None else float(normalize_db),
-            ref_ensure_max=ensure_max,
-            max_ref_seconds=None if max_seconds is None else float(max_seconds),
-        )
+        return ReferencePreprocessing(**merged)
     except ValueError as error:
         raise WorkerError(
             "invalid_reference",
@@ -933,19 +951,6 @@ def _preprocessing_from_settings(settings: VoiceGenerationSettings) -> Reference
         ref_ensure_max=settings.ref_ensure_max,
         max_ref_seconds=settings.max_ref_seconds,
     )
-
-
-def _reject_conflicting_preprocessing(
-    reference: dict[str, Any],
-    settings_payload: dict[str, Any],
-    reference_preprocessing: ReferencePreprocessing,
-    settings_preprocessing: ReferencePreprocessing,
-) -> None:
-    if "preprocessing" not in reference:
-        return
-    for name in _PREPROCESSING_FIELDS.intersection(settings_payload):
-        if getattr(reference_preprocessing, name) != getattr(settings_preprocessing, name):
-            raise _contradictory("conflicting_reference_preprocessing")
 
 
 def _validate_prepared_voice_id(value: Any) -> str:
@@ -993,12 +998,30 @@ def _contradictory(reason: str) -> WorkerError:
 def _reject_reference_output_collisions(references: Iterable[Path], output: Path) -> None:
     for reference in references:
         if reference == output:
+            raise _reference_output_collision()
+        try:
+            reference_stat = reference.stat()
+            output_stat = output.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
             raise WorkerError(
                 "invalid_request",
-                "参照音声と出力先には別のfileを指定してください。",
+                "参照音声と出力先のfile identityを確認できません。",
                 stage="validation",
-                reason="reference_is_output",
-            )
+                reason="reference_output_identity_unavailable",
+            ) from error
+        if os.path.samestat(reference_stat, output_stat):
+            raise _reference_output_collision()
+
+
+def _reference_output_collision() -> WorkerError:
+    return WorkerError(
+        "invalid_request",
+        "参照音声と出力先には別のfileを指定してください。",
+        stage="validation",
+        reason="reference_is_output",
+    )
 
 
 def _validate_output_path(value: Any) -> Path:
@@ -1051,6 +1074,8 @@ def _validate_settings(value: Any) -> VoiceGenerationSettings:
             if not isinstance(raw_value, str):
                 raise WorkerError("invalid_settings", f"{key}はstringにしてください。")
             coerced[key] = raw_value
+        elif raw_value is None and key == "ref_normalize_db":
+            coerced[key] = None
         else:
             if not isinstance(raw_value, expected) or isinstance(raw_value, bool):
                 raise WorkerError("invalid_settings", f"{key}はnumberにしてください。")

@@ -40,7 +40,7 @@ class VoiceGenerationSettings:
     seed: int = 1234
     num_candidates: int = 1
     decode_mode: str = "sequential"
-    ref_normalize_db: float = -16.0
+    ref_normalize_db: float | None = -16.0
     ref_ensure_max: bool = True
     max_ref_seconds: float = 30.0
 

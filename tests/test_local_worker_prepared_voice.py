@@ -31,6 +31,7 @@ class _PreparedFakeEngine:
         self.runtime_generation = f"{type(self).next_generation:032x}"
         type(self).next_generation += 1
         self.prepare_calls: list[bytes] = []
+        self.preprocessing_calls: list[dict] = []
         self.generate_calls: list[dict] = []
         self.no_ref_calls = 0
         self.load_count = 0
@@ -42,6 +43,7 @@ class _PreparedFakeEngine:
 
     def prepare_reference_conditioning(self, snapshot, **preprocessing):
         self.prepare_calls.append(snapshot)
+        self.preprocessing_calls.append(preprocessing)
         value = float(sum(snapshot) % 127)
         return PreparedReferenceConditioning(
             speaker_state=torch.full((1, 2, 2), value),
@@ -132,6 +134,13 @@ class LocalWorkerPreparedVoiceProtocolTest(unittest.TestCase):
             "output_path": str(output),
             **conditioning,
         }
+
+    def _create_hardlink(self, alias: Path, target: Path) -> None:
+        try:
+            alias.hardlink_to(target)
+        except (NotImplementedError, OSError) as error:
+            self.skipTest(f"hardlink creation is unavailable: {error}")
+        self.assertTrue(alias.samefile(target))
 
     def test_prepare_voice_miss_then_hit_returns_same_opaque_handle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -342,6 +351,225 @@ class LocalWorkerPreparedVoiceProtocolTest(unittest.TestCase):
         snapshot.assert_not_called()
         self.assertEqual(engine.prepare_calls, [])
         self.assertEqual(engine.generate_calls, [])
+
+    def test_resident_handle_rejects_hardlink_fallback_before_reference_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            output = base / "hardlink.wav"
+            reference.write_bytes(b"resident-hardlink")
+            self._create_hardlink(output, reference)
+            harness = _Harness()
+            generation = harness.preload(base / "outputs")["runtime_generation"]
+            prepared = harness.request(
+                {
+                    "id": "prepare",
+                    "type": "prepare_voice",
+                    "runtime_generation": generation,
+                    "reference": self._reference(reference),
+                }
+            )
+            engine = _PreparedFakeEngine.instances[0]
+            engine.generate_calls.clear()
+
+            with patch(
+                "irodori_tts.local_worker.snapshot_reference_file",
+                side_effect=AssertionError("hardlink validation read the reference"),
+            ) as snapshot:
+                response = harness.request(
+                    self._generate(
+                        output,
+                        runtime_generation=generation,
+                        prepared_voice_id=prepared["prepared_voice_id"],
+                        reference=self._reference(reference),
+                        reference_revision=prepared["reference_revision"],
+                    )
+                )
+
+        self.assertEqual(response["error"]["code"], "invalid_request")
+        self.assertEqual(response["error"]["reason"], "reference_is_output")
+        snapshot.assert_not_called()
+        self.assertEqual(len(engine.prepare_calls), 1)
+        self.assertEqual(engine.generate_calls, [])
+
+    def test_stale_and_reference_only_hardlink_collisions_reject_before_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            output = base / "hardlink.wav"
+            reference.write_bytes(b"fallback-hardlink")
+            self._create_hardlink(output, reference)
+            revision = snapshot_reference_file(reference, ReferencePreprocessing()).revision
+            harness = _Harness()
+            generation = harness.preload(base / "outputs")["runtime_generation"]
+            engine = _PreparedFakeEngine.instances[0]
+
+            with patch(
+                "irodori_tts.local_worker.snapshot_reference_file",
+                side_effect=AssertionError("hardlink validation read the reference"),
+            ) as snapshot:
+                stale = harness.request(
+                    self._generate(
+                        output,
+                        runtime_generation=generation,
+                        prepared_voice_id="f" * 32,
+                        reference=self._reference(reference),
+                        reference_revision=revision,
+                    )
+                )
+                reference_only = harness.request(
+                    self._generate(output, reference=self._reference(reference))
+                )
+
+        for response in (stale, reference_only):
+            self.assertEqual(response["error"]["code"], "invalid_request")
+            self.assertEqual(response["error"]["reason"], "reference_is_output")
+        snapshot.assert_not_called()
+        self.assertEqual(engine.prepare_calls, [])
+        self.assertEqual(engine.generate_calls, [])
+
+    def test_distinct_existing_and_new_output_paths_are_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            existing_output = base / "existing.wav"
+            new_output = base / "new.wav"
+            reference.write_bytes(b"reference")
+            existing_output.write_bytes(b"different")
+            harness = _Harness()
+
+            existing = harness.request(
+                self._generate(existing_output, reference=self._reference(reference))
+            )
+            new = harness.request(self._generate(new_output, reference=self._reference(reference)))
+
+        self.assertTrue(existing["ok"])
+        self.assertTrue(new["ok"])
+        self.assertEqual(len(_PreparedFakeEngine.instances[0].generate_calls), 2)
+
+    def test_preprocessing_conflicts_use_one_merged_effective_context(self) -> None:
+        accepted = (
+            ("both omit", None, {}, (-16.0, False, 30.0)),
+            (
+                "same normalize",
+                {"ref_normalize_db": -12},
+                {"ref_normalize_db": -12.0},
+                (-12.0, False, 30.0),
+            ),
+            (
+                "null normalize both",
+                {"ref_normalize_db": None},
+                {"ref_normalize_db": None},
+                (None, True, 30.0),
+            ),
+            (
+                "null plus settings ensure",
+                {"ref_normalize_db": None},
+                {"ref_ensure_max": True},
+                (None, True, 30.0),
+            ),
+            (
+                "null and same ensure",
+                {"ref_normalize_db": None, "ref_ensure_max": True},
+                {"ref_ensure_max": True},
+                (None, True, 30.0),
+            ),
+            (
+                "new reference only",
+                {"ref_normalize_db": None, "ref_ensure_max": False},
+                {},
+                (None, False, 30.0),
+            ),
+            (
+                "same max seconds",
+                {"max_ref_seconds": 12},
+                {"max_ref_seconds": 12.0},
+                (-16.0, False, 12.0),
+            ),
+        )
+        rejected = (
+            ("different normalize", {"ref_normalize_db": -12}, {"ref_normalize_db": -18}),
+            (
+                "null false versus true",
+                {"ref_normalize_db": None, "ref_ensure_max": False},
+                {"ref_ensure_max": True},
+            ),
+            (
+                "enabled normalize ensure disagreement",
+                {"ref_normalize_db": -16, "ref_ensure_max": False},
+                {"ref_ensure_max": True},
+            ),
+            ("different max seconds", {"max_ref_seconds": 12}, {"max_ref_seconds": 15}),
+        )
+
+        for name, reference_preprocessing, settings, expected in accepted:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                _PreparedFakeEngine.instances = []
+                base = Path(temp_dir)
+                reference = base / "voice.wav"
+                reference.write_bytes(name.encode())
+                harness = _Harness()
+                payload = self._generate(
+                    base / "reply.wav",
+                    reference=self._reference(reference, reference_preprocessing),
+                    settings=settings,
+                )
+
+                response = harness.request(payload)
+
+                self.assertTrue(response["ok"])
+                preprocessing = _PreparedFakeEngine.instances[0].preprocessing_calls[0]
+                self.assertEqual(
+                    (
+                        preprocessing["ref_normalize_db"],
+                        preprocessing["ref_ensure_max"],
+                        preprocessing["max_ref_seconds"],
+                    ),
+                    expected,
+                )
+
+        for name, reference_preprocessing, settings in rejected:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                _PreparedFakeEngine.instances = []
+                base = Path(temp_dir)
+                reference = base / "voice.wav"
+                reference.write_bytes(name.encode())
+                harness = _Harness()
+
+                response = harness.request(
+                    self._generate(
+                        base / "reply.wav",
+                        reference=self._reference(reference, reference_preprocessing),
+                        settings=settings,
+                    )
+                )
+
+                self.assertEqual(response["error"]["code"], "invalid_request")
+                self.assertEqual(
+                    response["error"]["reason"],
+                    "conflicting_reference_preprocessing",
+                )
+                self.assertEqual(_PreparedFakeEngine.instances, [])
+
+    def test_legacy_settings_keep_explicit_null_preprocessing_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            reference = base / "voice.wav"
+            reference.write_bytes(b"legacy-null")
+            harness = _Harness()
+
+            response = harness.request(
+                self._generate(
+                    base / "reply.wav",
+                    reference_audio=str(reference),
+                    settings={"ref_normalize_db": None, "ref_ensure_max": True},
+                )
+            )
+
+        self.assertTrue(response["ok"])
+        preprocessing = _PreparedFakeEngine.instances[0].preprocessing_calls[0]
+        self.assertIsNone(preprocessing["ref_normalize_db"])
+        self.assertIs(preprocessing["ref_ensure_max"], True)
 
     def test_protocol_paths_expand_home_for_legacy_b2_output_and_preload_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
