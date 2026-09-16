@@ -91,6 +91,8 @@ class _ReferenceRequest:
 class _CharacterVoice:
     kind: str
     lora_path: Path | None = None
+    compatibility_backend: str | None = None
+    compatibility_base_model_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -318,16 +320,7 @@ class LocalWorker:
         engine = self._require_engine()
         generation = self._validate_runtime_generation(request, required=True)
         character_session_id = _validate_character_session_id(request.get("character_session_id"))
-        try:
-            voice = _validate_character_voice(request.get("character_voice"))
-        except WorkerError as error:
-            self._log(
-                request_id,
-                "character_claim_failure",
-                runtime_generation=generation,
-                reason=error.reason,
-            )
-            raise
+        voice = _normalize_character_voice(request.get("character_voice"))
         requested_claim = _CharacterClaim(generation, character_session_id, voice)
 
         if self._claim_failed:
@@ -372,11 +365,22 @@ class LocalWorker:
             voice_kind=voice.kind,
         )
         try:
+            _validate_character_voice_resources(voice)
             _redirect_stdout_to_stderr(
                 self.error_stream,
                 engine.claim_character,
                 voice.lora_path,
             )
+        except WorkerError as error:
+            self._claim_failed = True
+            self._log(
+                request_id,
+                "character_claim_failure",
+                runtime_generation=generation,
+                voice_kind=voice.kind,
+                reason=error.reason,
+            )
+            raise
         except Exception as error:
             self._claim_failed = True
             self._log(
@@ -1094,7 +1098,7 @@ def _validate_character_session_id(value: Any) -> str:
     return value
 
 
-def _validate_character_voice(value: Any) -> _CharacterVoice:
+def _normalize_character_voice(value: Any) -> _CharacterVoice:
     if not isinstance(value, dict):
         raise _invalid_character_voice("invalid_character_voice_object")
     kind = value.get("kind")
@@ -1113,18 +1117,32 @@ def _validate_character_voice(value: Any) -> _CharacterVoice:
         "base_model_id",
     }:
         raise _invalid_character_voice("invalid_compatibility")
-    if compatibility.get("backend") != CHARACTER_BACKEND:
-        raise _invalid_character_voice("compatibility_backend_mismatch")
-    if compatibility.get("base_model_id") != CHARACTER_BASE_MODEL_ID:
-        raise _invalid_character_voice("compatibility_base_model_mismatch")
+    backend = compatibility.get("backend")
+    base_model_id = compatibility.get("base_model_id")
+    if not isinstance(backend, str) or not isinstance(base_model_id, str):
+        raise _invalid_character_voice("invalid_compatibility")
 
     raw_path = value.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise _invalid_character_voice("missing_lora_path")
     path = _resolve_protocol_path(raw_path)
-    if not path.is_dir():
+    return _CharacterVoice(
+        kind="lora",
+        lora_path=path,
+        compatibility_backend=backend,
+        compatibility_base_model_id=base_model_id,
+    )
+
+
+def _validate_character_voice_resources(voice: _CharacterVoice) -> None:
+    if voice.kind == "base":
+        return
+    if voice.compatibility_backend != CHARACTER_BACKEND:
+        raise _invalid_character_voice("compatibility_backend_mismatch")
+    if voice.compatibility_base_model_id != CHARACTER_BASE_MODEL_ID:
+        raise _invalid_character_voice("compatibility_base_model_mismatch")
+    if voice.lora_path is None or not voice.lora_path.is_dir():
         raise _invalid_character_voice("lora_path_not_directory")
-    return _CharacterVoice(kind="lora", lora_path=path)
 
 
 def _invalid_character_voice(reason: str) -> WorkerError:
