@@ -20,6 +20,8 @@ from irodori_tts.inference_runtime import (
 
 MODEL_REPO = "Aratako/Irodori-TTS-500M-v3"
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
+CHARACTER_BACKEND = "irodori"
+CHARACTER_BASE_MODEL_ID = MODEL_REPO
 
 MODEL_DEVICE = "cuda"
 MODEL_PRECISION = "bf16"
@@ -78,6 +80,10 @@ class VoiceEngine:
         if self._runtime is None:
             raise RuntimeError("音声生成エンジンが読み込まれていません。")
         return self._runtime.runtime_generation
+
+    @property
+    def character_state(self) -> str:
+        return self._require_runtime().lifecycle_state.value
 
     def load(self) -> None:
         """参照音声に依存せずモデルとCodecを読み込む。読み込み済みなら何もしない。"""
@@ -162,6 +168,13 @@ class VoiceEngine:
             ref_normalize_db=ref_normalize_db,
             ref_ensure_max=ref_ensure_max,
             max_ref_seconds=max_ref_seconds,
+        )
+
+    def claim_character(self, lora_adapter: str | Path | None = None) -> None:
+        """Permanently finalize this runtime for one base or LoRA character."""
+        runtime = self._require_runtime()
+        runtime.finalize_character(
+            None if lora_adapter is None else str(lora_adapter),
         )
 
     def generate_with_prepared(

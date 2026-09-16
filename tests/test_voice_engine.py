@@ -19,6 +19,8 @@ class FakeRuntime:
         self.prepared_references = []
         self.prepare_calls = []
         self.runtime_generation = "runtime-generation"
+        self.lifecycle_state = SimpleNamespace(value="base_ready")
+        self.finalize_calls = []
         self.unload_count = 0
 
     def synthesize(self, request, log_fn=None, prepared_reference=None):
@@ -41,6 +43,10 @@ class FakeRuntime:
 
     def unload(self) -> None:
         self.unload_count += 1
+
+    def finalize_character(self, lora_adapter=None) -> None:
+        self.finalize_calls.append(lora_adapter)
+        self.lifecycle_state = SimpleNamespace(value="character_locked")
 
 
 class VoiceEngineLoadTest(unittest.TestCase):
@@ -137,6 +143,17 @@ class VoiceEngineLoadTest(unittest.TestCase):
 
 
 class VoiceEngineGenerateTest(unittest.TestCase):
+    def test_character_claim_and_state_bridge_runtime_finalization(self) -> None:
+        runtime = FakeRuntime()
+        engine = VoiceEngine(None, Path("outputs"))
+        engine._runtime = runtime
+
+        self.assertEqual(engine.character_state, "base_ready")
+        engine.claim_character(Path("adapter"))
+
+        self.assertEqual(runtime.finalize_calls, ["adapter"])
+        self.assertEqual(engine.character_state, "character_locked")
+
     def test_default_settings_match_existing_sampling_values(self) -> None:
         settings = VoiceGenerationSettings()
 

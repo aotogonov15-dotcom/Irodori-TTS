@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Callable, Iterable
@@ -27,6 +28,8 @@ from irodori_tts.prepared_voice_cache import (
     snapshot_reference_file,
 )
 from irodori_tts.voice_engine import (
+    CHARACTER_BACKEND,
+    CHARACTER_BASE_MODEL_ID,
     VoiceEngine,
     VoiceGenerationResult,
     VoiceGenerationSettings,
@@ -34,8 +37,11 @@ from irodori_tts.voice_engine import (
 
 EngineFactory = Callable[[Path | None, Path], Any]
 
-PROTOCOL_VERSION = 3
-CAPABILITIES = ("no_ref", "prepared_voice_handles")
+PROTOCOL_VERSION = 4
+CAPABILITIES = ("no_ref", "prepared_voice_handles", "character_sessions")
+_EXPLICIT_CHARACTER_SESSION_MODE = "explicit"
+_LEGACY_CHARACTER_SESSION_MODE = "legacy"
+_ABSENT = object()
 _HANDLE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _REVISION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -81,6 +87,19 @@ class _ReferenceRequest:
     legacy: bool = False
 
 
+@dataclass(frozen=True)
+class _CharacterVoice:
+    kind: str
+    lora_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class _CharacterClaim:
+    runtime_generation: str
+    character_session_id: str
+    voice: _CharacterVoice
+
+
 class LocalWorker:
     def __init__(
         self,
@@ -101,6 +120,11 @@ class LocalWorker:
         self.engine: Any | None = None
         self.cache: PreparedVoiceCache | None = None
         self._closed = False
+        self._request_lock = threading.RLock()
+        self._character_session_mode: str | None = None
+        self._character_claim: _CharacterClaim | None = None
+        self._claim_reservation: _CharacterClaim | None = None
+        self._claim_failed = False
 
     @property
     def runtime_generation(self) -> str | None:
@@ -110,6 +134,10 @@ class LocalWorker:
         return generation if isinstance(generation, str) and generation else None
 
     def process_line(self, line: str) -> bool:
+        with self._request_lock:
+            return self._process_line(line)
+
+    def _process_line(self, line: str) -> bool:
         request_id: Any = None
         try:
             request = _parse_json_line(line)
@@ -137,6 +165,10 @@ class LocalWorker:
         return should_continue
 
     def close(self) -> None:
+        with self._request_lock:
+            self._close()
+
+    def _close(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -144,6 +176,11 @@ class LocalWorker:
         self.cache = None
         engine = self.engine
         self.engine = None
+        had_session_state = self._character_session_mode is not None
+        self._character_claim = None
+        self._claim_reservation = None
+        self._character_session_mode = None
+        self._claim_failed = False
         cleanup_errors: list[BaseException] = []
         if cache is not None:
             entries = None
@@ -167,6 +204,8 @@ class LocalWorker:
             except BaseException as error:
                 cleanup_errors.append(error)
             self._log_best_effort("worker", "engine_close")
+        if cache is not None or engine is not None or had_session_state:
+            self._log_best_effort("worker", "close")
         if cleanup_errors:
             raise cleanup_errors[0]
 
@@ -199,6 +238,8 @@ class LocalWorker:
             )
         if request_type == "preload":
             return self._handle_preload(request, request_id), True
+        if request_type == "claim_character":
+            return self._handle_claim_character(request, request_id), True
         if request_type == "prepare_voice":
             return self._handle_prepare_voice(request, request_id), True
         if request_type != "generate":
@@ -207,14 +248,35 @@ class LocalWorker:
         return self._handle_generate(request, request_id), True
 
     def _handle_preload(self, request: dict[str, Any], request_id: str) -> dict[str, Any]:
+        requested_mode = _validate_character_session_mode(
+            request.get("character_session_mode", _ABSENT)
+        )
+        mode_was_unset = self._character_session_mode is None
+        self._fix_character_session_mode(requested_mode)
+        if self._claim_failed:
+            raise WorkerError(
+                "runtime_unavailable",
+                "character claim失敗後のRuntimeは再利用できません。",
+                stage="preload",
+                reason="previous_claim_failed",
+            )
         reference_audio = _validate_optional_reference_audio(request.get("reference_audio"))
         output_dir = _validate_output_dir(request.get("output_dir"))
         already_loaded = self.engine is not None
 
-        self._log(request_id, "preload_start")
+        if mode_was_unset and requested_mode == _EXPLICIT_CHARACTER_SESSION_MODE:
+            self._log(request_id, "explicit_mode_enabled")
+        self._log(request_id, "preload_start", character_session_mode=requested_mode)
         self._ensure_engine(reference_audio, output_dir)
         generation = self._require_current_generation()
-        self._log(request_id, "preload_ok", runtime_generation=generation)
+        character_state = self._current_character_state()
+        self._log(
+            request_id,
+            "preload_ok",
+            runtime_generation=generation,
+            character_session_mode=requested_mode,
+            character_state=character_state,
+        )
         return {
             "id": request_id,
             "ok": True,
@@ -223,6 +285,140 @@ class LocalWorker:
             "protocol_version": PROTOCOL_VERSION,
             "capabilities": list(CAPABILITIES),
             "runtime_generation": generation,
+            "character_session_mode": requested_mode,
+            "character_state": character_state,
+        }
+
+    def _handle_claim_character(
+        self,
+        request: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        unsupported = set(request) - {
+            "id",
+            "type",
+            "runtime_generation",
+            "character_session_id",
+            "character_voice",
+        }
+        if unsupported:
+            raise WorkerError(
+                "invalid_request",
+                "claim_characterに未対応fieldを指定できません。",
+                stage="validation",
+                reason="unsupported_claim_field",
+            )
+        if self._character_session_mode != _EXPLICIT_CHARACTER_SESSION_MODE:
+            raise WorkerError(
+                "runtime_unavailable",
+                "explicit character session preloadを先に実行してください。",
+                stage="claim",
+                reason="explicit_mode_not_enabled",
+            )
+        engine = self._require_engine()
+        generation = self._validate_runtime_generation(request, required=True)
+        character_session_id = _validate_character_session_id(request.get("character_session_id"))
+        try:
+            voice = _validate_character_voice(request.get("character_voice"))
+        except WorkerError as error:
+            self._log(
+                request_id,
+                "character_claim_failure",
+                runtime_generation=generation,
+                reason=error.reason,
+            )
+            raise
+        requested_claim = _CharacterClaim(generation, character_session_id, voice)
+
+        if self._claim_failed:
+            raise WorkerError(
+                "runtime_unavailable",
+                "character claim失敗後のRuntimeは再利用できません。",
+                stage="claim",
+                reason="previous_claim_failed",
+            )
+        existing_claim = self._character_claim
+        if existing_claim is not None:
+            if existing_claim == requested_claim:
+                self._log(
+                    request_id,
+                    "character_claim_idempotent",
+                    runtime_generation=generation,
+                    voice_kind=voice.kind,
+                )
+                return self._claim_response(request_id, existing_claim, already_claimed=True)
+            self._log(
+                request_id,
+                "character_claim_conflict",
+                runtime_generation=generation,
+                voice_kind=voice.kind,
+            )
+            raise WorkerError(
+                "character_claim_conflict",
+                "Runtimeは別のimmutable character claimで既にlockされています。",
+                stage="claim",
+                reason=(
+                    "different_character_session"
+                    if existing_claim.character_session_id != character_session_id
+                    else "different_character_voice"
+                ),
+            )
+
+        self._claim_reservation = requested_claim
+        self._log(
+            request_id,
+            "character_claim_start",
+            runtime_generation=generation,
+            voice_kind=voice.kind,
+        )
+        try:
+            _redirect_stdout_to_stderr(
+                self.error_stream,
+                engine.claim_character,
+                voice.lora_path,
+            )
+        except Exception as error:
+            self._claim_failed = True
+            self._log(
+                request_id,
+                "character_claim_failure",
+                runtime_generation=generation,
+                voice_kind=voice.kind,
+                error_type=type(error).__name__,
+            )
+            raise WorkerError(
+                "invalid_character_voice",
+                "character voiceをRuntimeに適用できませんでした。",
+                stage="claim",
+                reason="character_finalize_failed",
+            ) from error
+        finally:
+            self._claim_reservation = None
+
+        self._character_claim = requested_claim
+        self._log(
+            request_id,
+            "character_claim_success",
+            runtime_generation=generation,
+            voice_kind=voice.kind,
+        )
+        return self._claim_response(request_id, requested_claim, already_claimed=False)
+
+    @staticmethod
+    def _claim_response(
+        request_id: str,
+        claim: _CharacterClaim,
+        *,
+        already_claimed: bool,
+    ) -> dict[str, Any]:
+        return {
+            "id": request_id,
+            "ok": True,
+            "runtime_generation": claim.runtime_generation,
+            "character_session_id": claim.character_session_id,
+            "character_state": "character_locked",
+            "voice_kind": claim.voice.kind,
+            "already_claimed": already_claimed,
         }
 
     def _handle_prepare_voice(
@@ -237,7 +433,13 @@ class LocalWorker:
                 stage="validation",
                 reason="no_ref_not_preparable",
             )
-        unsupported = set(request) - {"id", "type", "runtime_generation", "reference"}
+        unsupported = set(request) - {
+            "id",
+            "type",
+            "runtime_generation",
+            "character_session_id",
+            "reference",
+        }
         if unsupported:
             raise WorkerError(
                 "invalid_request",
@@ -246,7 +448,7 @@ class LocalWorker:
                 reason="unsupported_prepare_field",
             )
         engine = self._require_engine()
-        generation = self._validate_runtime_generation(request, required=True)
+        generation = self._validate_character_access(request, generation_required=True)
         reference = _validate_reference_request(request.get("reference"))
         snapshot = self._snapshot(reference)
         acquisition, duration = self._prepare_snapshot(engine, snapshot)
@@ -317,6 +519,8 @@ class LocalWorker:
         )
         handle = _validate_prepared_voice_id(raw_handle) if has_handle else None
 
+        if self._character_session_mode is None:
+            self._fix_character_session_mode(_LEGACY_CHARACTER_SESSION_MODE)
         self._log(request_id, "generate_start", runtime_generation=self.runtime_generation)
         engine = (
             self._require_engine()
@@ -326,7 +530,10 @@ class LocalWorker:
                 output_path.parent,
             )
         )
-        generation = self._validate_runtime_generation(request, required=has_handle)
+        generation = self._validate_character_access(
+            request,
+            generation_required=has_handle,
+        )
 
         if no_ref:
             result = self._run_generate(
@@ -644,6 +851,74 @@ class LocalWorker:
             )
         return generation
 
+    def _fix_character_session_mode(self, requested_mode: str) -> None:
+        current_mode = self._character_session_mode
+        if current_mode is None:
+            self._character_session_mode = requested_mode
+            return
+        if current_mode != requested_mode:
+            raise WorkerError(
+                "invalid_request",
+                "worker lifetime中にcharacter_session_modeを変更できません。",
+                stage="preload",
+                reason="character_session_mode_conflict",
+            )
+
+    def _current_character_state(self) -> str:
+        if self._claim_failed:
+            return "failed"
+        if self._character_claim is not None:
+            return "character_locked"
+        if self._character_session_mode == _EXPLICIT_CHARACTER_SESSION_MODE:
+            return "unclaimed"
+        engine = self.engine
+        if engine is not None:
+            state = getattr(engine, "character_state", None)
+            if state in {"character_locked", "failed"}:
+                return state
+        return "unclaimed"
+
+    def _validate_character_access(
+        self,
+        request: dict[str, Any],
+        *,
+        generation_required: bool,
+    ) -> str:
+        if self._character_session_mode != _EXPLICIT_CHARACTER_SESSION_MODE:
+            return self._validate_runtime_generation(request, required=generation_required)
+        if self._claim_failed:
+            raise WorkerError(
+                "runtime_unavailable",
+                "character claim失敗後のRuntimeは利用できません。",
+                stage="runtime",
+                reason="previous_claim_failed",
+            )
+        claim = self._character_claim
+        if claim is None:
+            raise WorkerError(
+                "character_not_locked",
+                "claim_characterを先に成功させてください。",
+                stage="character_session",
+                reason="character_not_locked",
+            )
+        generation = self._validate_runtime_generation(request, required=True)
+        supplied_session_id = request.get("character_session_id")
+        if not isinstance(supplied_session_id, str) or not supplied_session_id.strip():
+            raise WorkerError(
+                "character_session_mismatch",
+                "character_session_idを指定してください。",
+                stage="character_session",
+                reason="missing_character_session_id",
+            )
+        if supplied_session_id != claim.character_session_id:
+            raise WorkerError(
+                "character_session_mismatch",
+                "character_session_idが現在のclaimと一致しません。",
+                stage="character_session",
+                reason="character_session_mismatch",
+            )
+        return generation
+
     def _validate_runtime_generation(
         self,
         request: dict[str, Any],
@@ -793,6 +1068,72 @@ def _validate_request_id(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise WorkerError("invalid_request", "idは空でない文字列にしてください。")
     return value
+
+
+def _validate_character_session_mode(value: Any) -> str:
+    if value is _ABSENT:
+        return _LEGACY_CHARACTER_SESSION_MODE
+    if value == _EXPLICIT_CHARACTER_SESSION_MODE:
+        return _EXPLICIT_CHARACTER_SESSION_MODE
+    raise WorkerError(
+        "invalid_request",
+        "character_session_modeはexplicitのみ指定できます。",
+        stage="validation",
+        reason="invalid_character_session_mode",
+    )
+
+
+def _validate_character_session_id(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise WorkerError(
+            "invalid_request",
+            "character_session_idは空でない文字列にしてください。",
+            stage="validation",
+            reason="invalid_character_session_id",
+        )
+    return value
+
+
+def _validate_character_voice(value: Any) -> _CharacterVoice:
+    if not isinstance(value, dict):
+        raise _invalid_character_voice("invalid_character_voice_object")
+    kind = value.get("kind")
+    if kind == "base":
+        if set(value) != {"kind"}:
+            raise _invalid_character_voice("unsupported_base_voice_field")
+        return _CharacterVoice(kind="base")
+    if kind != "lora":
+        raise _invalid_character_voice("invalid_voice_kind")
+    if set(value) != {"kind", "path", "compatibility"}:
+        raise _invalid_character_voice("invalid_lora_voice_fields")
+
+    compatibility = value.get("compatibility")
+    if not isinstance(compatibility, dict) or set(compatibility) != {
+        "backend",
+        "base_model_id",
+    }:
+        raise _invalid_character_voice("invalid_compatibility")
+    if compatibility.get("backend") != CHARACTER_BACKEND:
+        raise _invalid_character_voice("compatibility_backend_mismatch")
+    if compatibility.get("base_model_id") != CHARACTER_BASE_MODEL_ID:
+        raise _invalid_character_voice("compatibility_base_model_mismatch")
+
+    raw_path = value.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise _invalid_character_voice("missing_lora_path")
+    path = _resolve_protocol_path(raw_path)
+    if not path.is_dir():
+        raise _invalid_character_voice("lora_path_not_directory")
+    return _CharacterVoice(kind="lora", lora_path=path)
+
+
+def _invalid_character_voice(reason: str) -> WorkerError:
+    return WorkerError(
+        "invalid_character_voice",
+        "character_voiceの指定が不正または現在のRuntimeと非互換です。",
+        stage="validation",
+        reason=reason,
+    )
 
 
 def _validate_text(value: Any) -> str:

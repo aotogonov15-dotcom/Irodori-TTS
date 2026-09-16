@@ -138,7 +138,10 @@ class LocalWorkerTest(unittest.TestCase):
         self.assertTrue(response["ready"])
         self.assertFalse(response["already_loaded"])
         self.assertEqual(response["protocol_version"], PROTOCOL_VERSION)
-        self.assertEqual(response["capabilities"], ["no_ref", "prepared_voice_handles"])
+        self.assertEqual(
+            response["capabilities"],
+            ["no_ref", "prepared_voice_handles", "character_sessions"],
+        )
         self.assertEqual(response["runtime_generation"], "00000000000000000000000000000001")
         self.assertEqual(len(FakeVoiceEngine.instances), 1)
         self.assertEqual(FakeVoiceEngine.instances[0].load_count, 1)
