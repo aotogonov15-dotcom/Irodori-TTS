@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from irodori_tts import local_worker as local_worker_module
-from irodori_tts.inference_runtime import PreparedReferenceConditioning
+from irodori_tts.inference_runtime import (
+    InferenceRuntime,
+    PreparedReferenceConditioning,
+    RuntimeLifecycle,
+)
 from irodori_tts.local_worker import CAPABILITIES, PROTOCOL_VERSION, LocalWorker
-from irodori_tts.voice_engine import VoiceGenerationResult
+from irodori_tts.voice_engine import VoiceEngine, VoiceGenerationResult
 
 
 class _CharacterSessionFakeEngine:
@@ -81,13 +88,13 @@ class _CharacterSessionFakeEngine:
 
 
 class _Harness:
-    def __init__(self) -> None:
+    def __init__(self, engine_factory=_CharacterSessionFakeEngine) -> None:
         self.output = io.StringIO()
         self.error = io.StringIO()
         self.worker = LocalWorker(
             output_stream=self.output,
             error_stream=self.error,
-            engine_factory=_CharacterSessionFakeEngine,
+            engine_factory=engine_factory,
         )
 
     def request(self, payload: dict) -> dict:
@@ -269,6 +276,14 @@ class LocalWorkerCharacterSessionTest(unittest.TestCase):
                     request_id="metadata-change",
                 )
             )
+            base_model_change = harness.request(
+                self._lora_claim(
+                    generation,
+                    adapter_a,
+                    base_model_id="Aratako/Irodori-TTS-500M-v4.1",
+                    request_id="base-model-change",
+                )
+            )
             to_base = harness.request(self._base_claim(generation, request_id="to-base"))
             other_session = harness.request(
                 self._lora_claim(
@@ -284,30 +299,83 @@ class LocalWorkerCharacterSessionTest(unittest.TestCase):
         self.assertTrue(retry["already_claimed"])
         self.assertEqual(switch["error"]["code"], "character_claim_conflict")
         self.assertEqual(metadata_change["error"]["reason"], "different_character_voice")
+        self.assertEqual(base_model_change["error"]["reason"], "different_character_voice")
         self.assertEqual(to_base["error"]["code"], "character_claim_conflict")
         self.assertEqual(other_session["error"]["reason"], "different_character_session")
         self.assertEqual(engine.claim_calls, [adapter_a.resolve()])
         self.assertEqual(engine.prepare_calls, 0)
 
-    def test_successful_lora_replay_does_not_revalidate_moved_source(self) -> None:
+    def test_lora_claim_path_identity_is_lexically_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            adapter = self._make_adapter(base / "adapter")
+            first_spelling = os.path.join(str(base), "missing", "..", "adapter")
+            harness = _Harness()
+            generation = harness.request(self._preload(base / "outputs"))["runtime_generation"]
+
+            first = harness.request(self._lora_claim(generation, first_spelling))
+            retry = harness.request(
+                self._lora_claim(generation, adapter, request_id="retry")
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(retry["already_claimed"])
+        self.assertEqual(_CharacterSessionFakeEngine.instances[0].claim_calls, [adapter])
+
+    @unittest.skipUnless(os.name == "nt", "Windows path case semantics")
+    def test_lora_claim_path_identity_uses_windows_case_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            adapter = self._make_adapter(base / "Adapter")
+            harness = _Harness()
+            generation = harness.request(self._preload(base / "outputs"))["runtime_generation"]
+
+            first = harness.request(self._lora_claim(generation, adapter))
+            retry = harness.request(
+                self._lora_claim(generation, str(adapter).swapcase(), request_id="retry")
+            )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(retry["already_claimed"])
+        self.assertEqual(len(_CharacterSessionFakeEngine.instances[0].claim_calls), 1)
+
+    def test_successful_lora_replay_performs_no_filesystem_resource_io(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             adapter = self._make_adapter(base / "adapter")
             harness = _Harness()
             generation = harness.request(self._preload(base / "outputs"))["runtime_generation"]
-            with mock.patch.object(
-                local_worker_module,
-                "_validate_character_voice_resources",
-                wraps=local_worker_module._validate_character_voice_resources,
-            ) as validate_resources:
-                first = harness.request(self._lora_claim(generation, adapter))
-                adapter.rename(base / "adapter-moved")
+            first = harness.request(self._lora_claim(generation, adapter))
+            adapter.rename(base / "adapter-moved")
+            with (
+                mock.patch.object(
+                    local_worker_module,
+                    "_validate_character_voice_resources",
+                    side_effect=AssertionError("resource validation during replay"),
+                ) as validate_resources,
+                mock.patch.object(
+                    local_worker_module.Path,
+                    "resolve",
+                    side_effect=AssertionError("path resolution during replay"),
+                ) as resolve_path,
+                mock.patch.object(
+                    local_worker_module.Path,
+                    "is_dir",
+                    side_effect=AssertionError("directory check during replay"),
+                ) as is_dir,
+                mock.patch.object(
+                    local_worker_module.Path,
+                    "exists",
+                    side_effect=AssertionError("existence check during replay"),
+                ) as exists,
+                mock.patch.object(
+                    local_worker_module.Path,
+                    "stat",
+                    side_effect=AssertionError("stat during replay"),
+                ) as stat,
+            ):
                 retry = harness.request(
-                    self._lora_claim(
-                        generation,
-                        adapter.parent / "missing-parent" / ".." / adapter.name,
-                        request_id="retry",
-                    )
+                    self._lora_claim(generation, adapter, request_id="retry")
                 )
 
         engine = _CharacterSessionFakeEngine.instances[0]
@@ -315,8 +383,111 @@ class LocalWorkerCharacterSessionTest(unittest.TestCase):
         self.assertFalse(first["already_claimed"])
         self.assertTrue(retry["ok"])
         self.assertTrue(retry["already_claimed"])
-        self.assertEqual(validate_resources.call_count, 1)
+        validate_resources.assert_not_called()
+        resolve_path.assert_not_called()
+        is_dir.assert_not_called()
+        exists.assert_not_called()
+        stat.assert_not_called()
         self.assertEqual(engine.claim_calls, [adapter.resolve()])
+
+    def test_relative_lora_claim_replay_uses_worker_start_directory(self) -> None:
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory(dir=original_cwd) as temp_dir:
+            base = Path(temp_dir)
+            adapter = self._make_adapter(base / "adapter")
+            changed_cwd = base / "changed-cwd"
+            changed_cwd.mkdir()
+            relative_adapter = os.path.relpath(adapter, start=original_cwd)
+            harness = _Harness()
+            generation = harness.request(self._preload(base / "outputs"))["runtime_generation"]
+            first = harness.request(self._lora_claim(generation, relative_adapter))
+            try:
+                os.chdir(changed_cwd)
+                retry = harness.request(
+                    self._lora_claim(generation, relative_adapter, request_id="retry")
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(retry["already_claimed"])
+        self.assertEqual(len(_CharacterSessionFakeEngine.instances[0].claim_calls), 1)
+
+    @unittest.skipUnless(os.name == "nt", "directory junctions are Windows-specific")
+    def test_successful_lora_replay_survives_junction_move(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            adapter = self._make_adapter(base / "adapter")
+            alias = base / "alias"
+            junction = subprocess.run(
+                ["cmd", "/d", "/c", "mklink", "/J", str(alias), str(adapter)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if junction.returncode != 0:
+                detail = (junction.stderr or junction.stdout).strip()
+                self.skipTest(f"could not create directory junction: {detail}")
+
+            harness = _Harness()
+            generation = harness.request(self._preload(base / "outputs"))["runtime_generation"]
+            first = harness.request(self._lora_claim(generation, alias))
+            alias.rename(base / "alias-moved")
+            with mock.patch.object(
+                local_worker_module,
+                "_validate_character_voice_resources",
+                side_effect=AssertionError("resource validation during junction replay"),
+            ) as validate_resources:
+                retry = harness.request(
+                    self._lora_claim(generation, alias, request_id="retry")
+                )
+
+        engine = _CharacterSessionFakeEngine.instances[0]
+        self.assertTrue(first["ok"])
+        self.assertTrue(retry["already_claimed"])
+        validate_resources.assert_not_called()
+        self.assertEqual(len(engine.claim_calls), 1)
+
+    def test_real_voice_engine_runtime_failure_poisons_worker_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            invalid_adapter = base / "invalid-adapter"
+            invalid_adapter.mkdir()
+            runtime = object.__new__(InferenceRuntime)
+            runtime.key = SimpleNamespace(compile_model=False)
+            runtime.model_device = torch.device("cpu")
+            runtime.codec_device = torch.device("cpu")
+            runtime._infer_lock = threading.Lock()
+            runtime._lifecycle_state = RuntimeLifecycle.BASE_READY
+            runtime._runtime_generation = "a" * 32
+            runtime._character_lora_adapter = None
+            runtime._character_adapter_name = None
+            runtime._failure_reason = None
+            engine = VoiceEngine(None, base / "outputs")
+            engine._runtime = runtime
+            harness = _Harness(engine_factory=lambda _reference, _output: engine)
+            generation = harness.request(self._preload(base / "outputs"))["runtime_generation"]
+
+            failed = harness.request(self._lora_claim(generation, invalid_adapter))
+            retry = harness.request(self._base_claim(generation, request_id="retry"))
+            inference = harness.request(
+                {
+                    "id": "generate",
+                    "type": "generate",
+                    "text": "hello",
+                    "no_ref": True,
+                    "runtime_generation": generation,
+                    "character_session_id": "character-1",
+                    "output_path": str(base / "output.wav"),
+                }
+            )
+
+        self.assertEqual(failed["error"]["reason"], "character_finalize_failed")
+        self.assertEqual(runtime.lifecycle_state, RuntimeLifecycle.BASE_READY)
+        self.assertTrue(harness.worker._claim_failed)
+        self.assertIsNone(harness.worker._character_claim)
+        self.assertEqual(retry["error"]["reason"], "previous_claim_failed")
+        self.assertEqual(inference["error"]["reason"], "previous_claim_failed")
 
     def test_compatibility_failures_poison_runtime(self) -> None:
         cases = (

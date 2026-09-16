@@ -88,18 +88,24 @@ class _ReferenceRequest:
 
 
 @dataclass(frozen=True)
-class _CharacterVoice:
+class _CharacterVoiceIdentity:
     kind: str
-    lora_path: Path | None = None
+    lora_path_identity: str | None = None
     compatibility_backend: str | None = None
     compatibility_base_model_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _CharacterVoiceRequest:
+    identity: _CharacterVoiceIdentity
+    lora_resource_path: Path | None = None
 
 
 @dataclass(frozen=True)
 class _CharacterClaim:
     runtime_generation: str
     character_session_id: str
-    voice: _CharacterVoice
+    voice: _CharacterVoiceIdentity
 
 
 class LocalWorker:
@@ -127,6 +133,7 @@ class LocalWorker:
         self._character_claim: _CharacterClaim | None = None
         self._claim_reservation: _CharacterClaim | None = None
         self._claim_failed = False
+        self._character_claim_path_base = _capture_character_claim_path_base()
 
     @property
     def runtime_generation(self) -> str | None:
@@ -320,9 +327,6 @@ class LocalWorker:
         engine = self._require_engine()
         generation = self._validate_runtime_generation(request, required=True)
         character_session_id = _validate_character_session_id(request.get("character_session_id"))
-        voice = _normalize_character_voice(request.get("character_voice"))
-        requested_claim = _CharacterClaim(generation, character_session_id, voice)
-
         if self._claim_failed:
             raise WorkerError(
                 "runtime_unavailable",
@@ -330,6 +334,13 @@ class LocalWorker:
                 stage="claim",
                 reason="previous_claim_failed",
             )
+        voice_request = _normalize_character_voice(
+            request.get("character_voice"),
+            path_base=self._character_claim_path_base,
+        )
+        voice = voice_request.identity
+        requested_claim = _CharacterClaim(generation, character_session_id, voice)
+
         existing_claim = self._character_claim
         if existing_claim is not None:
             if existing_claim == requested_claim:
@@ -365,11 +376,11 @@ class LocalWorker:
             voice_kind=voice.kind,
         )
         try:
-            _validate_character_voice_resources(voice)
+            _validate_character_voice_resources(voice_request)
             _redirect_stdout_to_stderr(
                 self.error_stream,
                 engine.claim_character,
-                voice.lora_path,
+                voice_request.lora_resource_path,
             )
         except WorkerError as error:
             self._claim_failed = True
@@ -1098,14 +1109,18 @@ def _validate_character_session_id(value: Any) -> str:
     return value
 
 
-def _normalize_character_voice(value: Any) -> _CharacterVoice:
+def _normalize_character_voice(
+    value: Any,
+    *,
+    path_base: str,
+) -> _CharacterVoiceRequest:
     if not isinstance(value, dict):
         raise _invalid_character_voice("invalid_character_voice_object")
     kind = value.get("kind")
     if kind == "base":
         if set(value) != {"kind"}:
             raise _invalid_character_voice("unsupported_base_voice_field")
-        return _CharacterVoice(kind="base")
+        return _CharacterVoiceRequest(_CharacterVoiceIdentity(kind="base"))
     if kind != "lora":
         raise _invalid_character_voice("invalid_voice_kind")
     if set(value) != {"kind", "path", "compatibility"}:
@@ -1125,23 +1140,42 @@ def _normalize_character_voice(value: Any) -> _CharacterVoice:
     raw_path = value.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise _invalid_character_voice("missing_lora_path")
-    path = _resolve_protocol_path(raw_path)
-    return _CharacterVoice(
-        kind="lora",
-        lora_path=path,
-        compatibility_backend=backend,
-        compatibility_base_model_id=base_model_id,
+    path_identity, resource_path = _normalize_character_claim_path(
+        raw_path,
+        path_base=path_base,
+    )
+    return _CharacterVoiceRequest(
+        identity=_CharacterVoiceIdentity(
+            kind="lora",
+            lora_path_identity=path_identity,
+            compatibility_backend=backend,
+            compatibility_base_model_id=base_model_id,
+        ),
+        lora_resource_path=resource_path,
     )
 
 
-def _validate_character_voice_resources(voice: _CharacterVoice) -> None:
+def _capture_character_claim_path_base() -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(os.curdir)))
+
+
+def _normalize_character_claim_path(value: str, *, path_base: str) -> tuple[str, Path]:
+    expanded = os.path.expanduser(value)
+    absolute = os.path.join(path_base, expanded)
+    normalized = os.path.normcase(os.path.normpath(absolute))
+    return normalized, Path(normalized)
+
+
+def _validate_character_voice_resources(voice_request: _CharacterVoiceRequest) -> None:
+    voice = voice_request.identity
     if voice.kind == "base":
         return
     if voice.compatibility_backend != CHARACTER_BACKEND:
         raise _invalid_character_voice("compatibility_backend_mismatch")
     if voice.compatibility_base_model_id != CHARACTER_BASE_MODEL_ID:
         raise _invalid_character_voice("compatibility_base_model_mismatch")
-    if voice.lora_path is None or not voice.lora_path.is_dir():
+    path = voice_request.lora_resource_path
+    if path is None or not path.is_dir():
         raise _invalid_character_voice("lora_path_not_directory")
 
 
